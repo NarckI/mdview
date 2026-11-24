@@ -1,0 +1,685 @@
+#!/usr/bin/env python3
+"""mdview - a small Markdown-only viewer with GitHub-style rendering and anchors."""
+import html as htmlmod
+import json
+import os
+import re
+import sys
+import time
+
+import markdown
+
+CSS = """
+:root, :root[data-theme="light"] {
+  color-scheme: light;
+  --bg:#ffffff; --fg:#1f2328; --muted:#59636e; --border:#d1d9e0; --code:#f6f8fa; --link:#0969da;
+  --t-comment:#59636e; --t-keyword:#cf222e; --t-string:#0a3069; --t-const:#0550ae;
+  --t-entity:#8250df; --t-var:#953800; --t-tag:#116329; }
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg:#0d1117; --fg:#e6edf3; --muted:#9198a1; --border:#3d444d; --code:#151b23; --link:#4493f8;
+  --t-comment:#9198a1; --t-keyword:#ff7b72; --t-string:#a5d6ff; --t-const:#79c0ff;
+  --t-entity:#d2a8ff; --t-var:#ffa657; --t-tag:#7ee787; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg:#0d1117; --fg:#e6edf3; --muted:#9198a1; --border:#3d444d; --code:#151b23; --link:#4493f8;
+    --t-comment:#9198a1; --t-keyword:#ff7b72; --t-string:#a5d6ff; --t-const:#79c0ff;
+    --t-entity:#d2a8ff; --t-var:#ffa657; --t-tag:#7ee787; } }
+body { background:var(--bg); color:var(--fg); margin:0; padding:32px 16px;
+       font:16px/1.6 -apple-system,"Segoe UI",Helvetica,Arial,sans-serif; }
+article { max-width:900px; margin:0 auto; }
+h1,h2,h3,h4,h5,h6 { margin:1.5em 0 .6em; line-height:1.25; font-weight:600; }
+h1,h2 { padding-bottom:.3em; border-bottom:1px solid var(--border); }
+h1 { font-size:2em; } h2 { font-size:1.5em; } h3 { font-size:1.25em; }
+a { color:var(--link); text-decoration:none; } a:hover { text-decoration:underline; }
+code { background:var(--code); padding:.2em .4em; border-radius:6px; font-size:85%;
+       font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+pre { background:var(--code); padding:16px; overflow:auto; border-radius:6px; line-height:1.45; margin:0 0 16px; }
+pre code { background:none; padding:0; font-size:85%; }
+.codehilite { margin:0 0 16px; } .codehilite pre { margin:0; }
+blockquote { margin:0 0 16px; padding:0 1em; color:var(--muted); border-left:.25em solid var(--border); }
+table { border-collapse:collapse; display:block; overflow:auto; }
+th,td { border:1px solid var(--border); padding:6px 13px; }
+tr:nth-child(2n) { background:var(--code); }
+img { max-width:100%; } hr { border:0; border-top:1px solid var(--border); margin:24px 0; }
+/* GitHub-like syntax colours (Pygments token classes) */
+.codehilite [class^="c"] { color:var(--t-comment); }
+.codehilite [class^="k"], .codehilite .o, .codehilite .ow { color:var(--t-keyword); }
+.codehilite [class^="s"] { color:var(--t-string); }
+.codehilite [class^="m"], .codehilite .il, .codehilite .na, .codehilite .nb,
+.codehilite .no, .codehilite .kc { color:var(--t-const); }
+.codehilite .nf, .codehilite .fm, .codehilite .nc, .codehilite .nn, .codehilite .nd { color:var(--t-entity); }
+.codehilite [class^="v"] { color:var(--t-var); }
+.codehilite .nt { color:var(--t-tag); }
+.codehilite .gd { color:#cf222e; } .codehilite .gi { color:#1a7f37; }
+.codehilite .err { color:inherit; background:none; }
+"""
+
+JS = """
+document.addEventListener('click', function (e) {
+  var a = e.target.closest('a'); if (!a) return;
+  var h = a.getAttribute('href');
+  if (h && h.charAt(0) === '#') {
+    e.preventDefault();
+    var id = decodeURIComponent(h.slice(1));
+    var el = document.getElementById(id) || document.getElementById(id.toLowerCase());
+    if (el) el.scrollIntoView();
+  }
+});
+var ticking = false;
+window.addEventListener('scroll', function () {
+  if (ticking) return; ticking = true;
+  requestAnimationFrame(function () {
+    ticking = false;
+    var max = document.documentElement.scrollHeight - window.innerHeight;
+    var w = window.webkit;
+    if (w && w.messageHandlers && w.messageHandlers.scroll)
+      w.messageHandlers.scroll.postMessage(max > 0 ? window.scrollY / max : 0);
+  });
+});
+"""
+
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "mdview", "theme")
+THEMES = ["auto", "light", "dark"]
+
+
+def gh_slug(text):
+    """GitHub-style heading slug: lowercase, drop punctuation, spaces -> hyphens."""
+    text = re.sub(r"<[^>]+>", "", text)
+    text = htmlmod.unescape(text).strip().lower()
+    text = re.sub(r"[^\w\- ]", "", text)
+    return text.replace(" ", "-")
+
+
+def add_heading_ids(body):
+    seen = {}
+
+    def repl(m):
+        level, inner = m.group(1), m.group(2)
+        slug = gh_slug(inner)
+        n = seen.get(slug, 0)
+        seen[slug] = n + 1
+        if n:
+            slug = f"{slug}-{n}"
+        return f'<h{level} id="{slug}">{inner}</h{level}>'
+
+    return re.sub(r"<h([1-6])>(.*?)</h\1>", repl, body, flags=re.S)
+
+
+def wikilinks_to_anchors(text):
+    """Turn Obsidian [[#Heading|label]] links into normal [label](#slug) links."""
+    def repl(m):
+        target, label = m.group(1), m.group(2) or m.group(1)
+        return f"[{label}](#{gh_slug(target)})"
+    return re.sub(r"\[\[#([^\]|]+)(?:\|([^\]]*))?\]\]", repl, text)
+
+
+def render_body(text):
+    text = wikilinks_to_anchors(text)
+    exts = ["fenced_code", "tables", "sane_lists"]
+    try:
+        import pygments  # noqa: F401
+        exts.append("codehilite")
+    except ImportError:
+        pass
+    body = markdown.markdown(text, extensions=exts,
+                             extension_configs={"codehilite": {"guess_lang": False, "css_class": "codehilite"}})
+    return add_heading_ids(body)
+
+
+def render(text, title="Markdown", theme="auto"):
+    body = render_body(text)
+    attr = "" if theme == "auto" else f' data-theme="{theme}"'
+    return (f"<!doctype html><html{attr}><head><meta charset='utf-8'><title>{htmlmod.escape(title)}</title>"
+            f"<style>{CSS}</style></head><body><article>{body}</article><script>{JS}</script></body></html>")
+
+
+def load_theme():
+    try:
+        t = open(CONFIG).read().strip()
+        return t if t in THEMES else "auto"
+    except OSError:
+        return "auto"
+
+
+def save_theme(t):
+    try:
+        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+        open(CONFIG, "w").write(t)
+    except OSError:
+        pass
+
+
+def run(argv):
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    try:
+        gi.require_version("WebKit2", "4.1")
+    except ValueError:
+        gi.require_version("WebKit2", "4.0")
+    from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2
+
+    LABELS = {"auto": "◐ Auto", "light": "☀ Light", "dark": "🌙 Dark"}
+
+    class Viewer(Gtk.Window):
+        def __init__(self):
+            super().__init__(title="mdview")
+            self.set_default_size(1100, 800)
+            self.path = None
+            self.mtime = 0
+            self.theme = load_theme()
+            self.dirty = False
+            self.loading = False
+            self.preview_id = 0
+
+            hb = Gtk.HeaderBar(show_close_button=True, title="mdview")
+            self.set_titlebar(hb)
+            open_btn = Gtk.Button(label="Open")
+            open_btn.connect("clicked", lambda *a: self.open_dialog())
+            hb.pack_start(open_btn)
+            self.edit_btn = Gtk.ToggleButton(label="✎ Edit")
+            self.edit_btn.set_tooltip_text("Edit this file with live preview (Ctrl+E)")
+            self.edit_btn.connect("toggled", self.on_edit_toggled)
+            hb.pack_start(self.edit_btn)
+            self.save_btn = Gtk.Button(label="💾 Save")
+            self.save_btn.set_tooltip_text("Save (Ctrl+S)")
+            self.save_btn.set_no_show_all(True)
+            self.save_btn.connect("clicked", lambda *a: self.save())
+            hb.pack_start(self.save_btn)
+            self.theme_btn = Gtk.Button()
+            self.theme_btn.set_tooltip_text("Switch theme: Auto / Light / Dark (Ctrl+D)")
+            self.theme_btn.connect("clicked", lambda *a: self.cycle_theme())
+            hb.pack_end(self.theme_btn)
+
+            # editor (left, hidden until Edit is on) + preview (right)
+            self.editor = Gtk.TextView()
+            self.editor.set_monospace(True)
+            self.editor.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+            self.editor.set_left_margin(12)
+            self.editor.set_right_margin(12)
+            self.editor.set_top_margin(10)
+            self.editor.set_bottom_margin(10)
+            self.buffer = self.editor.get_buffer()
+            self.buffer.connect("changed", self.on_changed)
+            self.editor_sw = Gtk.ScrolledWindow()
+            self.editor_sw.add(self.editor)
+            self.editor_sw.set_no_show_all(True)
+            self.editor_sw.get_vadjustment().connect("value-changed", self.on_editor_scroll)
+            self.lock, self.lock_until = None, 0.0
+
+            ucm = WebKit2.UserContentManager()
+            ucm.register_script_message_handler("scroll")
+            ucm.connect("script-message-received::scroll", self.on_preview_scroll)
+            self.view = WebKit2.WebView.new_with_user_content_manager(ucm)
+            self.view.connect("decide-policy", self.on_policy)
+            self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+            self.paned.pack1(self.editor_sw, True, False)
+            self.paned.pack2(self.view, True, True)
+            self.find_idle, self.flash = 0, None
+            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            vbox.pack_start(self.paned, True, True, 0)
+            vbox.pack_start(self.build_findbar(), False, False, 0)
+            self.add(vbox)
+
+            ag = Gtk.AccelGroup()
+            self.add_accel_group(ag)
+            shortcuts = (("o", self.open_dialog), ("r", lambda: self.load(self.path, force=True)),
+                         ("d", self.cycle_theme), ("s", self.save),
+                         ("e", lambda: self.edit_btn.set_active(not self.edit_btn.get_active())),
+                         ("f", self.open_find), ("h", lambda: self.open_find(True)),
+                         ("q", self.close))
+            for key, fn in shortcuts:
+                k, mod = Gtk.accelerator_parse("<Control>" + key)
+                ag.connect(k, mod, 0, lambda *a, fn=fn: fn() or True)
+            for accel, back in (("F3", False), ("<Shift>F3", True)):
+                k, mod = Gtk.accelerator_parse(accel)
+                ag.connect(k, mod, 0, lambda *a, back=back: self.find_step(back) or True)
+            self.sync_theme_ui()
+            GLib.timeout_add(1000, self.poll)
+            self.connect("delete-event", lambda *a: not self.confirm_discard())
+            self.connect("destroy", Gtk.main_quit)
+
+        # ---------- theme ----------
+        def sync_theme_ui(self):
+            self.theme_btn.set_label(LABELS[self.theme])
+            gs = Gtk.Settings.get_default()
+            if self.theme == "auto":
+                gs.reset_property("gtk-application-prefer-dark-theme")
+            else:
+                gs.set_property("gtk-application-prefer-dark-theme", self.theme == "dark")
+
+        def cycle_theme(self):
+            self.theme = THEMES[(THEMES.index(self.theme) + 1) % len(THEMES)]
+            save_theme(self.theme)
+            self.sync_theme_ui()
+            if self.theme == "auto":
+                js = "document.documentElement.removeAttribute('data-theme')"
+            else:
+                js = f"document.documentElement.setAttribute('data-theme','{self.theme}')"
+            self.view.run_javascript(js, None, None, None)  # no reload: scroll position is kept
+
+        # ---------- editing ----------
+        def update_title(self):
+            name = os.path.basename(self.path) if self.path else "mdview"
+            self.set_title(f"{'● ' if self.dirty else ''}{name} - mdview")
+
+        def on_edit_toggled(self, btn):
+            if btn.get_active():
+                self.editor.show()
+                self.editor_sw.show()
+                self.save_btn.show()
+                self.paned.set_position(max(300, self.get_allocated_width() // 2))
+                self.editor.grab_focus()
+            else:
+                self.editor_sw.hide()
+                self.save_btn.hide()
+            self.refresh_find_context()
+
+        def on_changed(self, buf):
+            if self.loading:
+                return
+            self.dirty = True
+            self.update_title()
+            if self.findbar.get_visible() and self.edit_btn.get_active():
+                self.schedule_find_update()
+            if self.preview_id:
+                GLib.source_remove(self.preview_id)
+            self.preview_id = GLib.timeout_add(250, self.live_preview)
+
+        def live_preview(self):  # swap the rendered body in place so scroll position is kept
+            self.preview_id = 0
+            start, end = self.buffer.get_bounds()
+            body = render_body(self.buffer.get_text(start, end, True))
+            js = ("var a=document.querySelector('article'); if(a){a.innerHTML=%s;}" % json.dumps(body))
+            self.view.run_javascript(js, None, None, None)
+            return False
+
+        def save(self):
+            if not self.path:
+                return
+            start, end = self.buffer.get_bounds()
+            try:
+                with open(self.path, "w", encoding="utf-8") as f:
+                    f.write(self.buffer.get_text(start, end, True))
+                self.mtime = os.path.getmtime(self.path)
+            except OSError as e:
+                self.message(f"Could not save: {e}")
+                return
+            self.dirty = False
+            self.update_title()
+
+        def message(self, text):
+            d = Gtk.MessageDialog(parent=self, modal=True, message_type=Gtk.MessageType.ERROR,
+                                  buttons=Gtk.ButtonsType.OK, text=text)
+            d.run()
+            d.destroy()
+
+        def confirm_discard(self):
+            """True if it is OK to replace/close the current document."""
+            if not self.dirty:
+                return True
+            d = Gtk.MessageDialog(parent=self, modal=True, message_type=Gtk.MessageType.QUESTION,
+                                  text="Save changes before continuing?")
+            d.format_secondary_text("Your changes will be lost if you don't save them.")
+            d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Discard", Gtk.ResponseType.REJECT,
+                          "Save", Gtk.ResponseType.ACCEPT)
+            r = d.run()
+            d.destroy()
+            if r == Gtk.ResponseType.ACCEPT:
+                self.save()
+                return not self.dirty
+            return r == Gtk.ResponseType.REJECT
+
+        # ---------- find & replace ----------
+        def build_findbar(self):
+            self.match_tag = self.buffer.create_tag("match", background="#f2cc60", foreground="#000000")
+            self.findbar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            self.findbar.set_border_width(6)
+
+            row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            self.find_entry = Gtk.SearchEntry()
+            self.find_entry.set_placeholder_text("Find")
+            self.find_entry.set_width_chars(30)
+            self.find_entry.connect("search-changed", lambda *a: self.on_find_changed())
+            self.find_entry.connect("activate", lambda *a: self.find_step(False))
+            self.find_entry.connect("next-match", lambda *a: self.find_step(False))
+            self.find_entry.connect("previous-match", lambda *a: self.find_step(True))
+            self.find_entry.connect("stop-search", lambda *a: self.close_find())
+            self.find_entry.connect("key-press-event", self.on_find_key)
+            prev_btn = Gtk.Button(label="▲")
+            prev_btn.set_tooltip_text("Previous match (Shift+F3)")
+            prev_btn.connect("clicked", lambda *a: self.find_step(True))
+            next_btn = Gtk.Button(label="▼")
+            next_btn.set_tooltip_text("Next match (F3 / Enter)")
+            next_btn.connect("clicked", lambda *a: self.find_step(False))
+            self.case_chk = Gtk.CheckButton(label="Match case")
+            self.case_chk.connect("toggled", lambda *a: self.on_find_changed())
+            self.count_lbl = Gtk.Label(label="")
+            close_btn = Gtk.Button(label="✕")
+            close_btn.set_relief(Gtk.ReliefStyle.NONE)
+            close_btn.connect("clicked", lambda *a: self.close_find())
+            for w in (self.find_entry, prev_btn, next_btn, self.case_chk, self.count_lbl):
+                row1.pack_start(w, False, False, 0)
+            row1.pack_end(close_btn, False, False, 0)
+
+            self.replace_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            self.replace_entry = Gtk.Entry()
+            self.replace_entry.set_placeholder_text("Replace with")
+            self.replace_entry.set_width_chars(30)
+            self.replace_entry.connect("activate", lambda *a: self.replace_current())
+            self.replace_entry.connect("key-press-event", self.on_find_key)
+            rep_btn = Gtk.Button(label="Replace")
+            rep_btn.connect("clicked", lambda *a: self.replace_current())
+            all_btn = Gtk.Button(label="Replace All")
+            all_btn.connect("clicked", lambda *a: self.replace_all())
+            for w in (self.replace_entry, rep_btn, all_btn):
+                self.replace_row.pack_start(w, False, False, 0)
+
+            self.findbar.pack_start(row1, False, False, 0)
+            self.findbar.pack_start(self.replace_row, False, False, 0)
+            row1.show_all()
+            self.replace_row.show_all()
+            self.replace_row.set_no_show_all(True)
+            self.replace_row.hide()
+            self.findbar.set_no_show_all(True)
+            self.findbar.hide()
+            return self.findbar
+
+        def editing(self):
+            return self.edit_btn.get_active()
+
+        def case_sensitive(self):
+            return self.case_chk.get_active()
+
+        def text_flags(self):
+            f = Gtk.TextSearchFlags.TEXT_ONLY
+            if not self.case_sensitive():
+                f |= Gtk.TextSearchFlags.CASE_INSENSITIVE
+            return f
+
+        def web_opts(self):
+            o = WebKit2.FindOptions.WRAP_AROUND
+            if not self.case_sensitive():
+                o |= WebKit2.FindOptions.CASE_INSENSITIVE
+            return o
+
+        def open_find(self, replace=False):
+            if replace and not self.editing():
+                self.edit_btn.set_active(True)  # replacing needs the editor
+            self.findbar.show()
+            if self.editing():
+                self.replace_row.show()
+                if self.buffer.get_has_selection():
+                    a, b = self.buffer.get_selection_bounds()
+                    sel = self.buffer.get_text(a, b, True)
+                    if sel and "\n" not in sel:
+                        self.find_entry.set_text(sel)
+            else:
+                self.replace_row.hide()
+            self.find_entry.grab_focus()
+            self.find_entry.select_region(0, -1)
+            self.on_find_changed()
+
+        def close_find(self):
+            self.findbar.hide()
+            self.clear_matches()
+            if self.editing():
+                self.editor.grab_focus()
+
+        def clear_matches(self):
+            start, end = self.buffer.get_bounds()
+            self.buffer.remove_tag(self.match_tag, start, end)
+            self.view.get_find_controller().search_finish()
+
+        def refresh_find_context(self):
+            if not self.findbar.get_visible():
+                return
+            if self.editing():
+                self.replace_row.show()
+            else:
+                self.replace_row.hide()
+            self.clear_matches()
+            self.on_find_changed()
+
+        def on_find_key(self, widget, event):
+            if event.keyval == Gdk.KEY_Escape:
+                self.close_find()
+                return True
+            if (widget is self.find_entry and event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter)
+                    and event.state & Gdk.ModifierType.SHIFT_MASK):
+                self.find_step(True)
+                return True
+            return False
+
+        def on_find_changed(self):
+            text = self.find_entry.get_text()
+            if self.editing():
+                self.update_editor_matches()
+                if text:
+                    self.find_step(False, keep=True)
+            else:
+                fc = self.view.get_find_controller()
+                if text:
+                    fc.search(text, self.web_opts(), 1000)
+                    self.count_lbl.set_text("")
+                    if not getattr(self, "_cm", False):
+                        fc.connect("counted-matches", self.on_counted)
+                        self._cm = True
+                    fc.count_matches(text, self.web_opts(), 1000)
+                else:
+                    fc.search_finish()
+                    self.count_lbl.set_text("")
+
+        def on_counted(self, fc, n):
+            self.count_lbl.set_text(f"{n} found" if n else "No results")
+
+        def schedule_find_update(self):
+            if not self.find_idle:
+                self.find_idle = GLib.idle_add(self.do_find_update)
+
+        def do_find_update(self):
+            self.find_idle = 0
+            if self.findbar.get_visible() and self.editing():
+                self.update_editor_matches()
+            return False
+
+        def update_editor_matches(self):
+            start, end = self.buffer.get_bounds()
+            self.buffer.remove_tag(self.match_tag, start, end)
+            text = self.find_entry.get_text()
+            flash, self.flash = self.flash, None  # one-time message such as "Replaced 3"
+            if not text:
+                self.count_lbl.set_text(flash or "")
+                return
+            count, it, flags = 0, start, self.text_flags()
+            while count < 5000:
+                m = it.forward_search(text, flags, None)
+                if not m:
+                    break
+                self.buffer.apply_tag(self.match_tag, m[0], m[1])
+                count += 1
+                it = m[1]
+            self.count_lbl.set_text(flash or (f"{count} found" if count else "No results"))
+
+        def find_step(self, backwards=False, keep=False):
+            text = self.find_entry.get_text()
+            if not text:
+                return
+            if not self.editing():
+                fc = self.view.get_find_controller()
+                fc.search_previous() if backwards else fc.search_next()
+                return
+            buf, flags = self.buffer, self.text_flags()
+            if buf.get_has_selection():
+                sel_s, sel_e = buf.get_selection_bounds()
+            else:
+                sel_s = sel_e = buf.get_iter_at_mark(buf.get_insert())
+            if backwards:
+                m = sel_s.backward_search(text, flags, None) or buf.get_end_iter().backward_search(text, flags, None)
+            else:
+                origin = sel_s if keep else sel_e
+                m = origin.forward_search(text, flags, None) or buf.get_start_iter().forward_search(text, flags, None)
+            if m:
+                buf.select_range(m[1], m[0])
+                self.editor.scroll_to_iter(m[0], 0.15, False, 0, 0)
+
+        def replace_current(self):
+            if not self.editing():
+                return
+            text, repl, buf = self.find_entry.get_text(), self.replace_entry.get_text(), self.buffer
+            if not text:
+                return
+            if buf.get_has_selection():
+                a, b = buf.get_selection_bounds()
+                sel = buf.get_text(a, b, True)
+                same = sel == text if self.case_sensitive() else sel.lower() == text.lower()
+                if same:
+                    buf.begin_user_action()
+                    buf.delete(a, b)
+                    buf.insert(a, repl)
+                    buf.end_user_action()
+            self.find_step(False)
+            self.schedule_find_update()
+
+        def replace_all(self):
+            if not self.editing():
+                return
+            text, repl, buf = self.find_entry.get_text(), self.replace_entry.get_text(), self.buffer
+            if not text:
+                return
+            flags, spans, it = self.text_flags(), [], buf.get_start_iter()
+            while True:
+                m = it.forward_search(text, flags, None)
+                if not m:
+                    break
+                spans.append((m[0].get_offset(), m[1].get_offset()))
+                it = m[1]
+            if not spans:
+                self.count_lbl.set_text("No results")
+                return
+            buf.begin_user_action()
+            for so, eo in reversed(spans):  # back to front so earlier offsets stay valid
+                a, b = buf.get_iter_at_offset(so), buf.get_iter_at_offset(eo)
+                buf.delete(a, b)
+                buf.insert(a, repl)
+            buf.end_user_action()
+            self.flash = f"Replaced {len(spans)}"
+            self.schedule_find_update()
+
+        # ---------- synchronized scrolling ----------
+        def locked(self, who):  # ignore the echo of a scroll we just caused ourselves
+            return self.lock == who and time.monotonic() < self.lock_until
+
+        def on_editor_scroll(self, adj):
+            if not self.editor_sw.get_visible() or self.locked("preview"):
+                return
+            self.lock, self.lock_until = "editor", time.monotonic() + 0.25
+            rng = adj.get_upper() - adj.get_page_size()
+            ratio = adj.get_value() / rng if rng > 0 else 0.0
+            js = ("var d=document.documentElement;"
+                  "window.scrollTo(0,%f*Math.max(0,d.scrollHeight-window.innerHeight));" % ratio)
+            self.view.run_javascript(js, None, None, None)
+
+        def on_preview_scroll(self, ucm, result):
+            if not self.editor_sw.get_visible() or self.locked("editor"):
+                return
+            val = result.get_js_value() if hasattr(result, "get_js_value") else result
+            ratio = max(0.0, min(1.0, val.to_double()))
+            adj = self.editor_sw.get_vadjustment()
+            rng = adj.get_upper() - adj.get_page_size()
+            if rng <= 0:
+                return
+            self.lock, self.lock_until = "preview", time.monotonic() + 0.25
+            adj.set_value(ratio * rng)
+
+        # ---------- loading ----------
+        def load(self, path, force=False):
+            if not path or not (force or self.confirm_discard()):
+                return
+            path = os.path.abspath(path)
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+                self.mtime = os.path.getmtime(path)
+            except OSError as e:
+                text, self.mtime = f"# Cannot open file\n\n{e}", 0
+            self.path = path
+            self.loading = True
+            self.buffer.set_text(text)
+            self.loading = False
+            self.dirty = False
+            self.update_title()
+            self.view.load_html(render(text, os.path.basename(path), self.theme),
+                                Gio.File.new_for_path(path).get_uri())
+
+        def poll(self):  # auto-reload when the file changes on disk (never over unsaved edits)
+            try:
+                if self.path and not self.dirty and os.path.getmtime(self.path) != self.mtime:
+                    self.load(self.path, force=True)
+            except OSError:
+                pass
+            return True
+
+        def open_dialog(self):
+            if not self.confirm_discard():
+                return
+            d = Gtk.FileChooserDialog(title="Open Markdown", parent=self, action=Gtk.FileChooserAction.OPEN)
+            d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Open", Gtk.ResponseType.OK)
+            flt = Gtk.FileFilter()
+            flt.set_name("Markdown")
+            for p in ("*.md", "*.markdown", "*.mdown"):
+                flt.add_pattern(p)
+            d.add_filter(flt)
+            if d.run() == Gtk.ResponseType.OK:
+                self.load(d.get_filename(), force=True)
+            d.destroy()
+
+        def on_policy(self, view, decision, dtype):
+            if dtype != WebKit2.PolicyDecisionType.NAVIGATION_ACTION:
+                return False
+            uri = decision.get_navigation_action().get_request().get_uri()
+            base = Gio.File.new_for_path(self.path).get_uri() if self.path else ""
+            if uri.startswith("about:") or uri == base or uri.startswith(base + "#"):
+                return False
+            if uri.startswith("file://"):
+                p = GLib.filename_from_uri(uri.split("#")[0])[0]
+                if p.lower().endswith((".md", ".markdown")):
+                    decision.ignore()
+                    self.load(p)
+                    return True
+            decision.ignore()
+            Gio.AppInfo.launch_default_for_uri(uri, None)
+            return True
+
+    w = Viewer()
+    w.show_all()
+    if len(argv) > 1:
+        w.load(argv[1], force=True)
+    else:
+        w.open_dialog()
+        if not w.path:
+            return
+    Gtk.main()
+
+
+def main():
+    try:
+        run(sys.argv)
+    except Exception:
+        import traceback
+        err = traceback.format_exc()
+        sys.stderr.write(err)
+        try:
+            d = os.path.join(os.path.expanduser("~/.cache"), "mdview")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "last-error.log"), "w") as f:
+                f.write(err)
+        except OSError:
+            pass
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
