@@ -4,10 +4,14 @@ import bisect
 import html as htmlmod
 import json
 import os
+import posixpath
 import re
 import sys
 import threading
 import time
+import urllib.parse
+import xml.etree.ElementTree as ET
+import zipfile
 
 import markdown
 
@@ -534,6 +538,959 @@ def md_spans(text):
                 out.append((tag, base + m.start(), base + m.end()))
         i += 1
     return out
+
+
+# ---------- Word (.docx) / OpenDocument (.odt) -> Markdown ----------
+CONVERT_EXTS = (".docx", ".odt")
+MAX_XML_BYTES = 200 * 1024 * 1024
+MONO_HINTS = ("courier", "consolas", "menlo", "monaco", "lucida console", "source code", "mono", "fira code",
+              "cascadia", "inconsolata", "typewriter", "andale", "terminal", "monospace")
+CODE_STYLE_HINTS = ("code", "preformatted", "source text", "verbatim", "listing")
+def is_quote_style(name):
+    return "quot" in name or name == "block text"
+
+
+
+
+class ConvertError(Exception):
+    pass
+
+
+def is_mono(font):
+    f = (font or "").lower()
+    return any(h in f for h in MONO_HINTS)
+
+
+def md_escape(s):
+    """Escape characters that would otherwise be read as Markdown."""
+    s = s.replace("\u00a0", " ").replace("\\", "\\\\")
+    s = re.sub(r"([`*\[\]])", r"\\\1", s)
+    s = re.sub(r"&(?=#?\w+;)", "&amp;", s).replace("<", "&lt;")
+    return re.sub(r"(?<![A-Za-z0-9])_|_(?![A-Za-z0-9])", r"\\_", s)
+
+
+def escape_line_start(line):
+    """Stop a plain line from turning into a heading, list item, quote or rule."""
+    m = re.match(r"^(\s*)(.*)$", line)
+    lead, rest = m.group(1), m.group(2)
+    if re.match(r"^(#{1,6}(\s|$)|[-+](\s|$)|>)", rest):
+        rest = "\\" + rest
+    elif re.match(r"^\d+[.)](\s|$)", rest):
+        rest = re.sub(r"^(\d+)([.)])", r"\1\\\2", rest)
+    elif re.match(r"^[-=_]{3,}\s*$", rest):
+        rest = "\\" + rest
+    return lead + rest
+
+
+def escape_text_lines(text):
+    return "\n".join(escape_line_start(ln) for ln in text.split("\n"))
+
+
+def code_span(core):
+    ticks = "`" * (max((len(m) for m in re.findall(r"`+", core)), default=0) + 1)
+    pad = " " if core.startswith("`") or core.endswith("`") else ""
+    return f"{ticks}{pad}{core}{pad}{ticks}"
+
+
+def fence_block(text):
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}\n{text}\n{fence}"
+
+
+def link_url(url):
+    return url.replace(" ", "%20").replace("(", "%28").replace(")", "%29")
+
+
+class Inline:
+    """Collects formatted pieces of text and renders them as Markdown, merging neighbouring
+    runs that share the same formatting so we get **a b** rather than **a** **b**."""
+
+    def __init__(self):
+        self.parts = []   # [key, text]; key is a format tuple, "raw" (already Markdown) or None (line break)
+
+    def add(self, text, b=False, i=False, s=False, code=False, sup=False, sub=False, href=None):
+        if not text:
+            return
+        key = (b, i, s, code, sup, sub, href)
+        if self.parts and self.parts[-1][0] == key:
+            self.parts[-1][1] += text
+        else:
+            self.parts.append([key, text])
+
+    def raw(self, md):
+        self.parts.append(["raw", md])
+
+    def br(self):
+        self.parts.append([None, ""])
+
+    def all_code(self):
+        texts = [k for k, t in self.parts if k not in (None, "raw") and t.strip()]
+        return bool(texts) and all(k[3] for k in texts) and not any(k == "raw" for k, _ in self.parts)
+
+    def render(self, bold=True):
+        out = []
+        for key, text in self.parts:
+            if key is None:
+                out.append("  \n")
+                continue
+            if key == "raw":
+                out.append(text)
+                continue
+            b, i, s, code, sup, sub, href = key
+            core = text.strip()
+            if not core:
+                out.append(" " if text else "")
+                continue
+            lead = " " if text[:1].isspace() else ""
+            trail = " " if text[-1:].isspace() else ""
+            core = core.replace("\u00a0", " ")
+            body = code_span(core) if code else md_escape(core)
+            if not code:
+                if i:
+                    body = f"*{body}*"
+                if b and bold:
+                    body = f"**{body}**"
+                if s:
+                    body = f"<del>{body}</del>"
+            if sup:
+                body = f"<sup>{body}</sup>"
+            elif sub:
+                body = f"<sub>{body}</sub>"
+            if href:
+                body = f"[{body}]({link_url(href)})"
+            out.append(lead + body + trail)
+        return "".join(out)
+
+
+class Media:
+    """Copies images out of the document into a folder next to the Markdown file."""
+
+    def __init__(self, zf, media_dir=None, media_rel="media"):
+        self.zf, self.dir, self.rel, self.done, self.used = zf, media_dir, media_rel, {}, set()
+        self.names = set(zf.namelist())
+
+    def add(self, member):
+        if member in self.done:
+            return self.done[member]
+        if member not in self.names:
+            return None
+        name = re.sub(r"[^\w.\- ]", "_", posixpath.basename(member)) or "image"
+        stem, ext = os.path.splitext(name)
+        k = 1
+        while name.lower() in self.used:
+            k += 1
+            name = f"{stem}_{k}{ext}"
+        self.used.add(name.lower())
+        if self.dir:
+            os.makedirs(self.dir, exist_ok=True)
+            with open(os.path.join(self.dir, name), "wb") as f:
+                f.write(self.zf.read(member))
+        self.done[member] = path = f"{urllib.parse.quote(self.rel)}/{urllib.parse.quote(name)}"
+        return path
+
+
+def alt_text(s):
+    return re.sub(r"[\[\]\n\r]", " ", s or "").strip()
+
+
+def render_table(rows):
+    rows = [r for r in rows if r is not None]
+    if not rows:
+        return ""
+    width = max(len(r) for r in rows)
+    rows = [r + [""] * (width - len(r)) for r in rows]
+    while width > 1 and all(not r[width - 1].strip() for r in rows):   # drop empty trailing columns
+        rows = [r[:width - 1] for r in rows]
+        width -= 1
+    def line(cells):
+        return "| " + " | ".join(c.strip() or " " for c in cells) + " |"
+    out = [line(rows[0]), "| " + " | ".join(["---"] * width) + " |"]
+    out += [line(r) for r in rows[1:]]
+    return "\n".join(out)
+
+
+def cell_markup(text):
+    """Make rendered inline Markdown safe inside a pipe-table cell."""
+    return text.replace("|", "&#124;").replace("  \n", "<br>").replace("\n", "<br>")
+
+
+def render_blocks(blocks):
+    """Turn the converters' block list into a Markdown document."""
+    pieces = []   # [kind, text, separator-override]
+    list_level = -1
+    top_ordered = None
+    prev = None
+    for blk in blocks:
+        kind = blk[0]
+        if kind == "li":
+            _, lvl, ordered, num, text = blk
+            lvl = min(lvl, list_level + 1) if prev == "li" else 0
+            list_level = lvl
+            marker = f"{num}." if ordered else "-"
+            sep = None
+            if lvl == 0:
+                if prev == "li" and top_ordered is not None and top_ordered != ordered:
+                    sep = "\n\n"   # bullets next to numbers must not run together
+                top_ordered = ordered
+            indent = "    " * lvl
+            cont = "\n" + indent + "    "
+            text = cont.join(escape_line_start(ln) if k == 0 else ln for k, ln in enumerate(text.split("\n")))
+            pieces.append(["li", f"{indent}{marker} {text}", sep])
+        elif kind == "code":
+            if prev == "code":
+                pieces[-1][1] += "\n" + blk[1]
+            else:
+                pieces.append(["code", blk[1], None])
+        elif kind == "quote":
+            pieces.append(["quote", "\n".join("> " + escape_line_start(ln) if ln.strip() else ">"
+                                              for ln in blk[1].split("\n")), None])
+        elif kind == "h":
+            pieces.append(["h", "#" * max(1, min(6, blk[1])) + " " + blk[2], None])
+        elif kind == "table":
+            md = render_table(blk[1])
+            if md:
+                pieces.append(["table", md, None])
+        elif kind == "hr":
+            pieces.append(["hr", "---", None])
+        else:
+            pieces.append(["p", escape_text_lines(blk[1]), None])
+        prev = kind
+    out = []
+    for n, (kind, text, sep) in enumerate(pieces):
+        if kind == "code":
+            text = fence_block(text)
+        if n:
+            before = pieces[n - 1][0]
+            if sep:
+                out.append(sep)
+            elif kind == "li" and before == "li":
+                out.append("\n")
+            elif kind == "quote" and before == "quote":
+                out.append("\n>\n")
+            else:
+                out.append("\n\n")
+        out.append(text)
+    return re.sub(r"\n{3,}", "\n\n", "".join(out)).strip() + "\n"
+
+
+# ---- .docx ----
+W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+WP = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
+VML_IMAGEDATA = "{urn:schemas-microsoft-com:vml}imagedata"
+
+
+def read_xml(zf, name, required=False):
+    try:
+        info = zf.getinfo(name)
+    except KeyError:
+        if required:
+            raise ConvertError(f"Not a valid document: {name} is missing")
+        return None
+    if info.file_size > MAX_XML_BYTES:
+        raise ConvertError(f"{name} is too large to convert")
+    return ET.fromstring(zf.read(name))
+
+
+def toggle_on(el):
+    v = el.get(W + "val")
+    return v is None or v.lower() not in ("0", "false", "off", "none")
+
+
+class DocxConverter:
+    def __init__(self, zf, media):
+        self.zf, self.media = zf, media
+        self.rels, self.raw_styles, self.style_cache = {}, {}, {}
+        self.num_fmt, self.counters = {}, {}
+        self.note_ids, self.note_order = {}, []
+
+    # --- setup
+    def load(self):
+        rels = read_xml(self.zf, "word/_rels/document.xml.rels")
+        if rels is not None:
+            for r in rels:
+                self.rels[r.get("Id")] = (r.get("Target", ""), r.get("TargetMode", ""))
+        styles = read_xml(self.zf, "word/styles.xml")
+        if styles is not None:
+            for st in styles.iter(W + "style"):
+                name_el, based = st.find(W + "name"), st.find(W + "basedOn")
+                self.raw_styles[st.get(W + "styleId")] = (
+                    name_el.get(W + "val", "") if name_el is not None else "",
+                    based.get(W + "val") if based is not None else None, st)
+        numbering = read_xml(self.zf, "word/numbering.xml")
+        if numbering is not None:
+            abstract = {}
+            for an in numbering.findall(W + "abstractNum"):
+                levels = {}
+                for lvl in an.findall(W + "lvl"):
+                    fmt, start = lvl.find(W + "numFmt"), lvl.find(W + "start")
+                    levels[int(lvl.get(W + "ilvl", "0"))] = (
+                        fmt.get(W + "val", "decimal") if fmt is not None else "decimal",
+                        int(start.get(W + "val", "1")) if start is not None else 1)
+                abstract[an.get(W + "abstractNumId")] = levels
+            for n in numbering.findall(W + "num"):
+                aid = n.find(W + "abstractNumId")
+                if aid is not None:
+                    for il, v in abstract.get(aid.get(W + "val"), {}).items():
+                        self.num_fmt[(n.get(W + "numId"), il)] = v
+
+    def style(self, sid, seen=()):
+        """Resolved properties of a paragraph/character style, following basedOn."""
+        if sid in self.style_cache:
+            return self.style_cache[sid]
+        base = dict(name="", b=False, i=False, s=False, mono=False, num=None, outline=None)
+        if sid not in self.raw_styles or sid in seen:
+            return base
+        name, based, el = self.raw_styles[sid]
+        info = dict(self.style(based, seen + (sid,))) if based else base
+        info["name"] = name
+        rpr = el.find(W + "rPr")
+        if rpr is not None:
+            info.update(self.run_flags(rpr, info))
+        ppr = el.find(W + "pPr")
+        if ppr is not None:
+            num = ppr.find(W + "numPr")
+            if num is not None:
+                nid, il = num.find(W + "numId"), num.find(W + "ilvl")
+                info["num"] = (nid.get(W + "val") if nid is not None else None,
+                               int(il.get(W + "val", "0")) if il is not None else None)
+            ol = ppr.find(W + "outlineLvl")
+            if ol is not None:
+                info["outline"] = int(ol.get(W + "val", "9"))
+        self.style_cache[sid] = info
+        return info
+
+    def run_flags(self, rpr, cur):
+        f = {k: cur[k] for k in ("b", "i", "s", "mono")}
+        f["sup"] = f["sub"] = False
+        if rpr is None:
+            return f
+        rs = rpr.find(W + "rStyle")
+        if rs is not None:
+            sinfo = self.style(rs.get(W + "val"))
+            for k in ("b", "i", "s", "mono"):
+                f[k] = f[k] or sinfo[k]
+        for key, tag in (("b", "b"), ("i", "i")):
+            el = rpr.find(W + tag)
+            if el is not None:
+                f[key] = toggle_on(el)
+        for tag in ("strike", "dstrike"):
+            el = rpr.find(W + tag)
+            if el is not None:
+                f["s"] = toggle_on(el)
+        rf = rpr.find(W + "rFonts")
+        if rf is not None:
+            fonts = [rf.get(W + a) for a in ("ascii", "hAnsi", "cs", "eastAsia")]
+            f["mono"] = any(is_mono(x) for x in fonts if x)
+        va = rpr.find(W + "vertAlign")
+        if va is not None:
+            f["sup"], f["sub"] = va.get(W + "val") == "superscript", va.get(W + "val") == "subscript"
+        return f
+
+    # --- paragraphs
+    def para_info(self, p):
+        ppr = p.find(W + "pPr")
+        sid, num, outline = None, None, None
+        if ppr is not None:
+            ps = ppr.find(W + "pStyle")
+            sid = ps.get(W + "val") if ps is not None else None
+            n = ppr.find(W + "numPr")
+            if n is not None:
+                nid, il = n.find(W + "numId"), n.find(W + "ilvl")
+                num = (nid.get(W + "val") if nid is not None else None,
+                       int(il.get(W + "val", "0")) if il is not None else None)
+            ol = ppr.find(W + "outlineLvl")
+            if ol is not None:
+                outline = int(ol.get(W + "val", "9"))
+        sinfo = self.style(sid) if sid else dict(name="", b=False, i=False, s=False, mono=False, num=None, outline=None)
+        name = sinfo["name"].lower()
+        level = None
+        m = re.match(r"heading\s*(\d)", name)
+        if m:
+            level = int(m.group(1))
+        elif name == "title":
+            level = 1
+        elif (outline if outline is not None else sinfo["outline"]) not in (None, 9):
+            level = (outline if outline is not None else sinfo["outline"]) + 1
+        if num is None and sinfo["num"] is not None:
+            num = sinfo["num"]
+        elif num is not None and sinfo["num"] is not None:
+            num = (num[0] if num[0] is not None else sinfo["num"][0], num[1] if num[1] is not None else sinfo["num"][1])
+        lm = re.match(r"list (bullet|number)\s*(\d?)", name)
+        if lm and not level:
+            depth = int(lm.group(2) or 1) - 1   # "List Bullet 2" is the second level
+            if num is None:
+                num = ("style:" + lm.group(1), depth)
+            elif num[1] in (None, 0) and depth:
+                num = (num[0], depth)
+        return sinfo, name, level, num
+
+    def inline_of(self, p, sinfo, heading=False):
+        inline = Inline()
+        base = {k: sinfo[k] for k in ("b", "i", "s", "mono")}
+        if heading:
+            base = dict(b=False, i=False, s=False, mono=False)
+        self.runs(p, inline, base, None, {"active": False, "instr": "", "href": None})
+        return inline
+
+    def plain(self, p):
+        out = []
+        for r in p.iter(W + "r"):
+            for c in r:
+                if c.tag == W + "t":
+                    out.append(c.text or "")
+                elif c.tag == W + "tab":
+                    out.append("    ")
+                elif c.tag in (W + "br", W + "cr") and c.get(W + "type") not in ("page", "column"):
+                    out.append("\n")
+        return "".join(out).replace("\u00a0", " ")
+
+    def paragraph(self, p):
+        sinfo, name, level, num = self.para_info(p)
+        if re.match(r"(toc \d|table of contents|toc heading)", name) or name in ("toc heading", "contents heading"):
+            return []
+        inline = self.inline_of(p, sinfo, heading=bool(level))
+        if level:
+            text = re.sub(r"\s+", " ", inline.render(bold=False)).strip()
+            return [("h", level, text)] if text else []
+        if num is not None and num[0] not in (None, "0"):
+            text = inline.render().strip()
+            if not text:
+                return []
+            ordered, number = self.list_kind(num)
+            return [("li", num[1] or 0, ordered, number, text)]
+        if inline.all_code() or any(h in name for h in CODE_STYLE_HINTS) or sinfo["mono"]:
+            text = self.plain(p)
+            if text.strip():
+                return [("code", text.rstrip())]
+        text = inline.render().strip()
+        if not text:
+            return []
+        if is_quote_style(name):
+            return [("quote", text)]
+        return [("p", text)]
+
+    def list_kind(self, num):
+        nid, il = num[0], num[1] or 0
+        if nid.startswith("style:"):
+            return nid == "style:number", self.next_number(nid, il, 1)
+        fmt, start = self.num_fmt.get((nid, il), ("bullet", 1))
+        if fmt in ("bullet", "none"):
+            return False, 0
+        return True, self.next_number(nid, il, start)
+
+    def next_number(self, nid, il, start):
+        c = self.counters.setdefault(nid, {})
+        c[il] = c.get(il, start - 1) + 1
+        for k in [k for k in c if k > il]:
+            del c[k]
+        return c[il]
+
+    # --- runs
+    def runs(self, parent, inline, base, href, st):
+        for ch in parent:
+            t = ch.tag
+            if t == W + "r":
+                self.run(ch, inline, base, href, st)
+            elif t == W + "hyperlink":
+                target = href
+                rid = ch.get(R + "id")
+                if rid and rid in self.rels and self.rels[rid][1] == "External":
+                    target = self.rels[rid][0]
+                self.runs(ch, inline, base, target, st)
+            elif t == W + "fldSimple":
+                m = re.search(r'HYPERLINK\s+"([^"]+)"', ch.get(W + "instr", ""))
+                self.runs(ch, inline, base, m.group(1) if m and "\\l" not in ch.get(W + "instr", "") else href, st)
+            elif t in (W + "ins", W + "smartTag", W + "customXml", W + "bdo", W + "dir", W + "moveTo"):
+                self.runs(ch, inline, base, href, st)
+            elif t == W + "sdt":
+                content = ch.find(W + "sdtContent")
+                if content is not None:
+                    self.runs(content, inline, base, href, st)
+
+    def run(self, r, inline, base, href, st):
+        f = self.run_flags(r.find(W + "rPr"), base)
+        link = href or st["href"]
+        for c in r:
+            t = c.tag
+            if t == W + "t":
+                if not st["active"]:
+                    inline.add(c.text or "", f["b"], f["i"], f["s"], f["mono"], f["sup"], f["sub"], link)
+            elif t == W + "instrText":
+                st["instr"] += c.text or ""
+            elif t == W + "fldChar":
+                kind = c.get(W + "fldCharType")
+                if kind == "begin":
+                    st["active"], st["instr"] = True, ""
+                elif kind == "separate":
+                    st["active"] = False
+                    m = re.search(r'HYPERLINK\s+"([^"]+)"', st["instr"])
+                    st["href"] = m.group(1) if m and "\\l" not in st["instr"] else None
+                elif kind == "end":
+                    st["active"], st["href"] = False, None
+            elif t == W + "tab":
+                inline.add(" ", f["b"], f["i"], f["s"], f["mono"])
+            elif t in (W + "br", W + "cr"):
+                if c.get(W + "type") not in ("page", "column"):
+                    inline.br()
+            elif t == W + "noBreakHyphen":
+                inline.add("-", f["b"], f["i"], f["s"], f["mono"])
+            elif t == W + "drawing":
+                self.image(c, inline)
+            elif t == W + "pict":
+                for im in c.iter(VML_IMAGEDATA):
+                    self.add_image(im.get(R + "id"), "", inline)
+            elif t in (W + "footnoteReference", W + "endnoteReference"):
+                kind = "footnote" if t == W + "footnoteReference" else "endnote"
+                key = (kind, c.get(W + "id"))
+                if key not in self.note_ids:
+                    self.note_ids[key] = len(self.note_ids) + 1
+                    self.note_order.append(key)
+                inline.add(str(self.note_ids[key]), sup=True)
+
+    def image(self, drawing, inline):
+        alt = ""
+        for dp in drawing.iter(WP + "docPr"):
+            alt = dp.get("descr") or dp.get("title") or ""
+            break
+        for blip in drawing.iter(A + "blip"):
+            self.add_image(blip.get(R + "embed"), alt, inline)
+
+    def add_image(self, rid, alt, inline):
+        rel = self.rels.get(rid)
+        if not rel or rel[1] == "External":
+            return
+        target = rel[0].lstrip("/") if rel[0].startswith("/") else posixpath.normpath("word/" + rel[0])
+        path = self.media.add(target)
+        if path:
+            inline.raw(f"![{alt_text(alt)}]({path})")
+
+    # --- tables
+    def cell_text(self, tc, bold=True):
+        parts = []
+        for ch in tc:
+            if ch.tag == W + "p":
+                sinfo, name, level, num = self.para_info(ch)
+                text = self.inline_of(ch, sinfo, heading=bool(level)).render(bold=bold).strip()
+                if text:
+                    parts.append(("• " if num is not None and num[0] not in (None, "0") else "") + text)
+            elif ch.tag == W + "tbl":
+                text = " ".join(self.plain(p).strip() for p in ch.iter(W + "p") if self.plain(p).strip())
+                if text:
+                    parts.append(md_escape(text))
+        return cell_markup("<br>".join(parts))
+
+    def table(self, tbl):
+        rows = []
+        for tr in tbl.findall(W + "tr"):
+            cells = []
+            for tc in tr.findall(W + "tc"):
+                tcpr = tc.find(W + "tcPr")
+                span, vmerge_cont = 1, False
+                if tcpr is not None:
+                    gs = tcpr.find(W + "gridSpan")
+                    if gs is not None:
+                        span = max(1, int(gs.get(W + "val", "1")))
+                    vm = tcpr.find(W + "vMerge")
+                    vmerge_cont = vm is not None and vm.get(W + "val") != "restart"
+                cells.append("" if vmerge_cont else self.cell_text(tc, bold=bool(rows)))   # header row is bold anyway
+                cells.extend([""] * (span - 1))
+            rows.append(cells)
+        return ("table", rows)
+
+    def walk(self, parent):
+        blocks = []
+        for el in parent:
+            if el.tag == W + "p":
+                blocks += self.paragraph(el)
+            elif el.tag == W + "tbl":
+                blocks.append(self.table(el))
+            elif el.tag == W + "sdt":
+                content = el.find(W + "sdtContent")
+                if content is not None:
+                    blocks += self.walk(content)
+        return blocks
+
+    def notes(self):
+        blocks = []
+        roots = {}
+        for kind, fname in (("footnote", "word/footnotes.xml"), ("endnote", "word/endnotes.xml")):
+            roots[kind] = read_xml(self.zf, fname)
+        for key in self.note_order:
+            kind, nid = key
+            root, texts = roots.get(kind), []
+            if root is not None:
+                for note in root.findall(W + kind):
+                    if note.get(W + "id") == nid:
+                        for p in note.iter(W + "p"):
+                            sinfo, _, _, _ = self.para_info(p)
+                            t = self.inline_of(p, sinfo).render().strip()
+                            if t:
+                                texts.append(t)
+            blocks.append(("li", 0, True, self.note_ids[key], " ".join(texts) or "(empty note)"))
+        return ([("hr",)] + blocks) if blocks else []
+
+    def convert(self):
+        self.load()
+        doc = read_xml(self.zf, "word/document.xml", required=True)
+        body = doc.find(W + "body")
+        if body is None:
+            raise ConvertError("Not a valid Word document (no body)")
+        return render_blocks(self.walk(body) + self.notes())
+
+
+# ---- .odt ----
+OFFICE = "{urn:oasis:names:tc:opendocument:xmlns:office:1.0}"
+TEXT = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}"
+TABLE = "{urn:oasis:names:tc:opendocument:xmlns:table:1.0}"
+DRAW = "{urn:oasis:names:tc:opendocument:xmlns:drawing:1.0}"
+STYLE = "{urn:oasis:names:tc:opendocument:xmlns:style:1.0}"
+FO = "{urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0}"
+SVG = "{urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0}"
+XLINK = "{http://www.w3.org/1999/xlink}"
+
+
+class OdtConverter:
+    def __init__(self, zf, media):
+        self.zf, self.media = zf, media
+        self.fonts_mono, self.styles, self.list_styles = set(), {}, {}
+        self.notes, self.style_cache = [], {}
+
+    def load(self, *roots):
+        for root in roots:
+            if root is None:
+                continue
+            for ff in root.iter(STYLE + "font-face"):
+                fam = ff.get(SVG + "font-family", "")
+                if ff.get(STYLE + "font-pitch") == "fixed" or is_mono(fam) or is_mono(ff.get(STYLE + "name")):
+                    self.fonts_mono.add(ff.get(STYLE + "name"))
+            for st in root.iter(STYLE + "style"):
+                self.styles[st.get(STYLE + "name")] = st
+            for ls in root.iter(TEXT + "list-style"):
+                levels = {}
+                for lv in ls:
+                    n = int(lv.get(TEXT + "level", "1"))
+                    if lv.tag == TEXT + "list-level-style-number" and lv.get(STYLE + "num-format"):
+                        levels[n] = "number"
+                    else:
+                        levels[n] = "bullet"
+                self.list_styles[ls.get(STYLE + "name")] = levels
+
+    def style(self, name, seen=()):
+        """Resolved text properties and the chain of style names for a style."""
+        if name in self.style_cache:
+            return self.style_cache[name]
+        info = dict(b=False, i=False, s=False, mono=False, sup=False, sub=False, names=[])
+        st = self.styles.get(name)
+        if st is None or name in seen:
+            return info
+        parent = st.get(STYLE + "parent-style-name")
+        if parent:
+            info = dict(self.style(parent, seen + (name,)))
+            info["names"] = list(info["names"])
+        info["names"].append(name.replace("_20_", " ").lower())
+        tp = st.find(STYLE + "text-properties")
+        if tp is not None:
+            w, it = tp.get(FO + "font-weight"), tp.get(FO + "font-style")
+            if w is not None:
+                info["b"] = w in ("bold", "600", "700", "800", "900")
+            if it is not None:
+                info["i"] = it in ("italic", "oblique")
+            ls = tp.get(STYLE + "text-line-through-style")
+            if ls is not None:
+                info["s"] = ls != "none"
+            pos = tp.get(STYLE + "text-position")
+            if pos is not None:
+                first = pos.split()[0]
+                info["sup"] = first == "super" or (first.rstrip("%").lstrip("+").replace(".", "", 1).isdigit()
+                                                   and not first.startswith("-") and first.rstrip("%") not in ("0", ""))
+                info["sub"] = first == "sub" or first.startswith("-")
+            fonts = [tp.get(STYLE + "font-name"), tp.get(FO + "font-family")]
+            if any(f and (f in self.fonts_mono or is_mono(f)) for f in fonts):
+                info["mono"] = True
+            elif any(fonts):
+                info["mono"] = False
+        self.style_cache[name] = info
+        return info
+
+    # --- inline content
+    def walk_inline(self, el, inline, fmt, href):
+        if el.text:
+            self.emit(el.text, inline, fmt, href)
+        for ch in el:
+            t = ch.tag
+            if t == TEXT + "span":
+                sf = self.style(ch.get(TEXT + "style-name"))
+                f2 = dict(fmt)
+                for k in ("b", "i", "s", "sup", "sub"):
+                    f2[k] = fmt[k] or sf[k] if k in ("b", "i", "s") else sf[k]
+                f2["mono"] = sf["mono"] or fmt["mono"]
+                self.walk_inline(ch, inline, f2, href)
+            elif t == TEXT + "a":
+                self.walk_inline(ch, inline, fmt, ch.get(XLINK + "href") or href)
+            elif t == TEXT + "s":
+                self.emit(" " * int(ch.get(TEXT + "c", "1")), inline, fmt, href)
+            elif t == TEXT + "tab":
+                self.emit(" ", inline, fmt, href)
+            elif t == TEXT + "line-break":
+                inline.br()
+            elif t == DRAW + "frame":
+                self.frame(ch, inline)
+            elif t == TEXT + "note":
+                body = ch.find(TEXT + "note-body")
+                texts = []
+                if body is not None:
+                    for p in body:
+                        if p.tag in (TEXT + "p", TEXT + "h"):
+                            tx = self.para_text(p)
+                            if tx:
+                                texts.append(tx)
+                self.notes.append(" ".join(texts) or "(empty note)")
+                inline.add(str(len(self.notes)), sup=True)
+            elif t in (TEXT + "bookmark", TEXT + "bookmark-start", TEXT + "bookmark-end", TEXT + "soft-page-break",
+                       TEXT + "note-citation", TEXT + "number", TEXT + "reference-mark", TEXT + "reference-mark-start",
+                       TEXT + "reference-mark-end", TEXT + "change", TEXT + "change-start", TEXT + "change-end"):
+                pass
+            else:   # unknown wrapper (e.g. text:meta, text:bookmark-ref): keep its text
+                self.walk_inline(ch, inline, fmt, href)
+            if ch.tail:
+                self.emit(ch.tail, inline, fmt, href)
+
+    def emit(self, text, inline, f, href):
+        inline.add(text, f["b"], f["i"], f["s"], f["mono"], f["sup"], f["sub"], href)
+
+    def frame(self, fr, inline):
+        alt = ""
+        for tag in ("desc", "title"):
+            e = fr.find(SVG + tag)
+            if e is not None and e.text:
+                alt = e.text
+                break
+        for img in fr.iter(DRAW + "image"):
+            href = (img.get(XLINK + "href") or "").lstrip("./")
+            if href.startswith("http"):
+                inline.raw(f"![{alt_text(alt)}]({link_url(href)})")
+                continue
+            path = self.media.add(href)
+            if path:
+                inline.raw(f"![{alt_text(alt)}]({path})")
+
+    def base_fmt(self, el, heading=False):
+        info = self.style(el.get(TEXT + "style-name"))
+        f = dict(b=info["b"], i=info["i"], s=info["s"], mono=info["mono"], sup=False, sub=False)
+        if heading:
+            f.update(b=False, i=False, s=False, mono=False)
+        return f, info
+
+    def para_text(self, p, heading=False, bold=True):
+        f, _ = self.base_fmt(p, heading)
+        inline = Inline()
+        self.walk_inline(p, inline, f, None)
+        return inline.render(bold=bold and not heading).strip()
+
+    def plain(self, p):
+        out = []
+
+        def rec(el):
+            if el.text:
+                out.append(el.text)
+            for ch in el:
+                if ch.tag == TEXT + "s":
+                    out.append(" " * int(ch.get(TEXT + "c", "1")))
+                elif ch.tag == TEXT + "tab":
+                    out.append("    ")
+                elif ch.tag == TEXT + "line-break":
+                    out.append("\n")
+                elif ch.tag in (TEXT + "note", DRAW + "frame"):
+                    pass
+                else:
+                    rec(ch)
+                if ch.tail:
+                    out.append(ch.tail)
+        rec(p)
+        return "".join(out).replace("\u00a0", " ")
+
+    # --- blocks
+    def para(self, p):
+        f, info = self.base_fmt(p)
+        names = info["names"]
+        inline = Inline()
+        self.walk_inline(p, inline, f, None)
+        if inline.all_code() or info["mono"] or any(h in n for n in names for h in CODE_STYLE_HINTS):
+            text = self.plain(p)
+            if text.strip():
+                return [("code", text.rstrip())]
+        text = inline.render().strip()
+        if not text:
+            return []
+        if any(is_quote_style(n) for n in names):
+            return [("quote", text)]
+        return [("p", text)]
+
+    def list_blocks(self, el, depth, lstyle):
+        sname = el.get(TEXT + "style-name") or lstyle
+        kind = self.list_styles.get(sname, {}).get(depth + 1, "bullet")
+        n = 1
+        out = []
+        for item in el:
+            if item.tag not in (TEXT + "list-item", TEXT + "list-header"):
+                continue
+            if item.get(TEXT + "start-value"):
+                n = int(item.get(TEXT + "start-value"))
+            texts, subs = [], []
+            for ch in item:
+                if ch.tag in (TEXT + "p", TEXT + "h"):
+                    t = self.para_text(ch)
+                    if t:
+                        texts.append(t)
+                elif ch.tag == TEXT + "list":
+                    subs += self.list_blocks(ch, depth + 1, sname)
+            if texts:
+                out.append(("li", depth, kind == "number", n, "  \n".join(texts)))
+                n += 1
+            out += subs
+        return out
+
+    def cell_text(self, cell, bold=True):
+        parts = []
+        for ch in cell:
+            if ch.tag in (TEXT + "p", TEXT + "h"):
+                t = self.para_text(ch, bold=bold)
+                if t:
+                    parts.append(t)
+            elif ch.tag == TEXT + "list":
+                for blk in self.list_blocks(ch, 0, None):
+                    parts.append("• " + blk[4])
+            elif ch.tag == TABLE + "table":
+                t = " ".join(self.plain(p).strip() for p in ch.iter(TEXT + "p") if self.plain(p).strip())
+                if t:
+                    parts.append(md_escape(t))
+        return cell_markup("<br>".join(parts))
+
+    def table(self, tbl):
+        rows = []
+
+        def collect(parent):
+            for ch in parent:
+                if ch.tag == TABLE + "table-row":
+                    cells = []
+                    for c in ch:
+                        if c.tag == TABLE + "table-cell":
+                            text = self.cell_text(c, bold=bool(rows))
+                            rep = min(int(c.get(TABLE + "number-columns-repeated", "1")), 50)
+                            span = int(c.get(TABLE + "number-columns-spanned", "1"))
+                            for _ in range(rep):
+                                cells.append(text)
+                                cells.extend([""] * (span - 1))
+                        elif c.tag == TABLE + "covered-table-cell":
+                            cells.append("")
+                    rows.append(cells)
+                elif ch.tag in (TABLE + "table-header-rows", TABLE + "table-row-group", TABLE + "table-rows"):
+                    collect(ch)
+        collect(tbl)
+        return ("table", rows)
+
+    def walk(self, parent, lstyle=None):
+        blocks = []
+        for el in parent:
+            t = el.tag
+            if t == TEXT + "h":
+                text = re.sub(r"\s+", " ", self.para_text(el, heading=True)).strip()
+                if text:
+                    blocks.append(("h", int(el.get(TEXT + "outline-level", "1") or 1), text))
+            elif t == TEXT + "p":
+                blocks += self.para(el)
+            elif t == TEXT + "list":
+                blocks += self.list_blocks(el, 0, lstyle)
+            elif t == TABLE + "table":
+                blocks.append(self.table(el))
+            elif t == TEXT + "section":
+                blocks += self.walk(el, lstyle)
+        return blocks
+
+    def convert(self):
+        content = read_xml(self.zf, "content.xml", required=True)
+        self.load(read_xml(self.zf, "styles.xml"), content)
+        body = content.find(OFFICE + "body")
+        text = body.find(OFFICE + "text") if body is not None else None
+        if text is None:
+            raise ConvertError("Not a valid OpenDocument text file")
+        blocks = self.walk(text)
+        if self.notes:
+            blocks.append(("hr",))
+            blocks += [("li", 0, True, n, t) for n, t in enumerate(self.notes, 1)]
+        return render_blocks(blocks)
+
+
+def convert_to_markdown(src, media_dir=None, media_rel="media"):
+    """Markdown text for a .docx or .odt file. Images are copied into media_dir (if given) and
+    referenced as media_rel/<name>."""
+    ext = os.path.splitext(src)[1].lower()
+    if ext not in CONVERT_EXTS:
+        raise ConvertError("Only .docx and .odt files can be converted")
+    try:
+        with zipfile.ZipFile(src) as zf:
+            media = Media(zf, media_dir, media_rel)
+            conv = DocxConverter(zf, media) if ext == ".docx" else OdtConverter(zf, media)
+            return conv.convert()
+    except zipfile.BadZipFile:
+        raise ConvertError(f"{os.path.basename(src)} is not a valid {ext[1:]} file")
+    except ET.ParseError as e:
+        raise ConvertError(f"The document's XML could not be read: {e}")
+    except OSError as e:
+        raise ConvertError(str(e))
+
+
+def convert_file(src, dest=None):
+    """Convert src next to itself (or to dest). Returns (dest_path, number_of_images)."""
+    stem = os.path.splitext(os.path.basename(src))[0]
+    dest = os.path.abspath(dest or os.path.join(os.path.dirname(os.path.abspath(src)), stem + ".md"))
+    media_name = os.path.splitext(os.path.basename(dest))[0] + "_media"
+    media_dir = os.path.join(os.path.dirname(dest), media_name)
+    existed = os.path.isdir(media_dir)
+    text = convert_to_markdown(src, media_dir, media_name)
+    try:
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError as e:
+        raise ConvertError(f"Could not write {dest}: {e}")
+    count = len(os.listdir(media_dir)) if os.path.isdir(media_dir) else 0
+    if not existed and count == 0 and os.path.isdir(media_dir):
+        os.rmdir(media_dir)
+    return dest, count
+
+
+def convert_cli(args):
+    """mdview --convert INPUT.docx|.odt [-o OUTPUT.md | -o -] [--force]"""
+    src, out, force = None, None, False
+    it = iter(args)
+    for a in it:
+        if a in ("-o", "--output"):
+            out = next(it, None)
+        elif a in ("-f", "--force"):
+            force = True
+        elif src is None:
+            src = a
+    if not src or out == "":
+        sys.stderr.write(convert_cli.__doc__.strip() + "\n")
+        return 2
+    try:
+        if out == "-":
+            sys.stdout.write(convert_to_markdown(src, None, "media"))
+            return 0
+        dest = os.path.abspath(out) if out else os.path.join(
+            os.path.dirname(os.path.abspath(src)), os.path.splitext(os.path.basename(src))[0] + ".md")
+        if os.path.exists(dest) and not force:
+            sys.stderr.write(f"{dest} already exists (use --force to overwrite or -o to choose another name)\n")
+            return 1
+        dest, count = convert_file(src, dest)
+    except ConvertError as e:
+        sys.stderr.write(f"mdview: {e}\n")
+        return 1
+    print(f"Wrote {dest}" + (f" and {count} image(s)" if count else ""))
+    return 0
 
 
 def run(argv):
@@ -1088,6 +2045,8 @@ def run(argv):
             return False
 
         def open_path(self, path):
+            if path.lower().endswith(CONVERT_EXTS):   # Word / OpenDocument: convert, then open the result
+                return self.convert_and_open(path)
             path = os.path.realpath(path)
             for d in self.docs:
                 if d.path and os.path.realpath(d.path) == path:
@@ -1096,6 +2055,27 @@ def run(argv):
             d = self.add_doc()
             d.load(path)
             return d
+
+        def convert_and_open(self, src):
+            """Convert a .docx/.odt to Markdown (asking where to save it) and open the result in a tab."""
+            dlg = Gtk.FileChooserDialog(title="Convert to Markdown: save as", parent=self,
+                                        action=Gtk.FileChooserAction.SAVE)
+            dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Convert", Gtk.ResponseType.OK)
+            dlg.set_do_overwrite_confirmation(True)
+            dlg.set_current_folder(os.path.dirname(os.path.abspath(src)))
+            dlg.set_current_name(os.path.splitext(os.path.basename(src))[0] + ".md")
+            dest = dlg.get_filename() if dlg.run() == Gtk.ResponseType.OK else None
+            dlg.destroy()
+            if not dest:
+                return None
+            if not dest.lower().endswith((".md", ".markdown", ".mdown")):
+                dest += ".md"
+            try:
+                dest, _ = convert_file(src, dest)
+            except ConvertError as e:
+                self.message(f"Could not convert {os.path.basename(src)}:\n{e}")
+                return None
+            return self.open_path(dest)
 
         def close_current(self):
             if self.doc is not None:
@@ -1572,11 +2552,14 @@ def run(argv):
             dlg = Gtk.FileChooserDialog(title="Open Markdown", parent=self, action=Gtk.FileChooserAction.OPEN)
             dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Open", Gtk.ResponseType.OK)
             dlg.set_select_multiple(True)
-            flt = Gtk.FileFilter()
-            flt.set_name("Markdown")
-            for p in ("*.md", "*.markdown", "*.mdown"):
-                flt.add_pattern(p)
-            dlg.add_filter(flt)
+            for label, pats in (("Markdown, Word and OpenDocument", ("*.md", "*.markdown", "*.mdown", "*.docx", "*.odt")),
+                                ("Markdown", ("*.md", "*.markdown", "*.mdown")),
+                                ("Word / OpenDocument (converted to Markdown)", ("*.docx", "*.odt"))):
+                flt = Gtk.FileFilter()
+                flt.set_name(label)
+                for pat in pats:
+                    flt.add_pattern(pat)
+                dlg.add_filter(flt)
             paths = dlg.get_filenames() if dlg.run() == Gtk.ResponseType.OK else []
             dlg.destroy()
             for p in paths:
@@ -1595,6 +2578,8 @@ def run(argv):
 
 
 def main():
+    if sys.argv[1:2] in (["--convert"], ["-c"]):   # no window needed
+        sys.exit(convert_cli(sys.argv[2:]))
     try:
         run(sys.argv)
     except Exception:

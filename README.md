@@ -15,6 +15,8 @@ A small Markdown-only viewer and editor for Debian, built with GTK 3 and WebKitG
 - Tabs: open several files at once, switch with `Ctrl+Tab` in most-recently-used order (like Alt+Tab)
 - Line-accurate scroll sync between the editor and the preview
 - Undo / redo in the editor (`Ctrl+Z`, `Ctrl+Y`), with Markdown syntax colouring
+- Convert Word (`.docx`) and OpenDocument (`.odt`) files to Markdown: just open them (`Ctrl+O`), or run
+  `mdview --convert file.docx` from a terminal. No extra software needed
 - Large-file mode (over ~1 MB): the window opens immediately and the preview fills in progressively
 - Regular-expression find and replace, with `\1` / `\g<name>` group references
 
@@ -82,3 +84,25 @@ If the app does not start, run it from a terminal (`mdview file.md`). Crashes ar
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+## Converting Word and OpenDocument files
+
+Open a `.docx` or `.odt` file (or pass it on the command line) and mdview asks where to save the Markdown,
+converts it, and opens the result in a new tab. Images are saved in a `<name>_media` folder next to it.
+
+From a terminal, without opening a window:
+
+```
+mdview --convert report.docx                # writes report.md (and report_media/) next to it
+mdview --convert report.odt -o notes.md     # choose the output file
+mdview --convert report.docx -o -           # print Markdown to stdout (images are not extracted)
+mdview --convert report.docx --force        # overwrite an existing .md
+```
+
+What comes across: headings, paragraphs, bold / italic / strikethrough (as `<del>`), inline and block code
+(monospace fonts or code styles), links, bulleted and numbered lists (nested), tables, block quotes, images,
+footnotes (as superscript numbers with a list at the end) and line breaks.
+
+What does not: colours, fonts and layout, underline, text boxes, comments, tracked-change history, and
+formulas. Old binary `.doc` and `.rtf` files are not supported; save them as `.docx` or `.odt` first.
+Tables become plain Markdown tables, so merged cells are flattened.
