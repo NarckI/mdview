@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """mdview - a small Markdown-only viewer with GitHub-style rendering and anchors."""
+import bisect
 import html as htmlmod
 import json
 import os
@@ -67,15 +68,59 @@ document.addEventListener('click', function (e) {
     if (el) el.scrollIntoView();
   }
 });
+/* Line-based scroll sync. mdTag() pairs top-level blocks (or, failing that, headings) with the
+   source line they start on; mdScroll()/the scroll listener interpolate between those anchors. */
+var MD = {els: null, lines: null, total: 0};
+function mdTag(blocks, heads, total) {
+  var art = document.querySelector('article');
+  MD.els = null; MD.lines = null; MD.total = total || 0;
+  if (!art) return;
+  if (blocks && blocks.length && art.children.length === blocks.length) {
+    MD.els = Array.prototype.slice.call(art.children); MD.lines = blocks;
+  } else if (heads && heads.length) {
+    var hs = art.querySelectorAll('h1,h2,h3,h4,h5,h6');
+    if (hs.length === heads.length) { MD.els = Array.prototype.slice.call(hs); MD.lines = heads; }
+  }
+}
+function mdPoints() {
+  var ls = [0], ys = [0], sy = window.scrollY;
+  if (MD.els) for (var i = 0; i < MD.els.length; i++) {
+    var l = MD.lines[i], y = MD.els[i].getBoundingClientRect().top + sy;
+    if (l > ls[ls.length - 1] && y >= ys[ys.length - 1]) { ls.push(l); ys.push(y); }
+  }
+  var art = document.querySelector('article');
+  var end = art ? art.getBoundingClientRect().bottom + sy : 0;
+  ls.push(Math.max(MD.total, ls[ls.length - 1] + 1)); ys.push(Math.max(end, ys[ys.length - 1]));
+  return [ls, ys];
+}
+function mdInterp(xs, ys, x) {
+  var lo = 0, hi = xs.length - 1;
+  if (x <= xs[0]) return ys[0];
+  if (x >= xs[hi]) return ys[hi];
+  while (hi - lo > 1) { var m = (lo + hi) >> 1; if (xs[m] <= x) lo = m; else hi = m; }
+  var d = xs[hi] - xs[lo];
+  return d > 0 ? ys[lo] + (x - xs[lo]) / d * (ys[hi] - ys[lo]) : ys[lo];
+}
+function mdScroll(line, ratio) {
+  var d = document.documentElement, max = Math.max(0, d.scrollHeight - window.innerHeight), y;
+  if (MD.els) {
+    var p = mdPoints(); y = mdInterp(p[0], p[1], line);
+    var w = Math.max(0, Math.min(1, (ratio - 0.9) * 10 + 1e-9));  /* glide to the true end of the page */
+    y = y * (1 - w) + ratio * max * w;
+  } else y = ratio * max;
+  window.scrollTo(0, Math.max(0, Math.min(max, y)));
+}
 var ticking = false;
 window.addEventListener('scroll', function () {
   if (ticking) return; ticking = true;
   requestAnimationFrame(function () {
     ticking = false;
-    var max = document.documentElement.scrollHeight - window.innerHeight;
     var w = window.webkit;
-    if (w && w.messageHandlers && w.messageHandlers.scroll)
-      w.messageHandlers.scroll.postMessage(max > 0 ? window.scrollY / max : 0);
+    if (!(w && w.messageHandlers && w.messageHandlers.scroll)) return;
+    var d = document.documentElement, max = d.scrollHeight - window.innerHeight;
+    var ratio = max > 0 ? window.scrollY / max : 0, line = 0;
+    if (MD.els) { var p = mdPoints(); line = mdInterp(p[1], p[0], window.scrollY); }
+    w.messageHandlers.scroll.postMessage(JSON.stringify({ratio: ratio, line: line, ok: !!MD.els}));
   });
 });
 """
@@ -132,7 +177,7 @@ def render(text, title="Markdown", theme="auto"):
     body = render_body(text)
     attr = "" if theme == "auto" else f' data-theme="{theme}"'
     return (f"<!doctype html><html{attr}><head><meta charset='utf-8'><title>{htmlmod.escape(title)}</title>"
-            f"<style>{CSS}</style></head><body><article>{body}</article><script>{JS}</script></body></html>")
+            f"<style>{CSS}</style></head><body><article>{body}</article><script>{JS}{tag_call(text)}</script></body></html>")
 
 
 def load_theme():
@@ -151,6 +196,291 @@ def save_theme(t):
         pass
 
 
+# ---------- source <-> preview line mapping (for scroll sync) ----------
+FENCE_RE = re.compile(r"^(`{3,}|~{3,})")
+ATX_RE = re.compile(r"^#{1,6}")
+SETEXT_RE = re.compile(r"^(?:=+|-+)[ ]*$")
+HR_RE = re.compile(r"^ {0,3}(?:(?:-[ ]*){3,}|(?:\*[ ]*){3,}|(?:_[ ]*){3,})$")
+INDENT_RE = re.compile(r"^(?: {4}|\t)")
+QUOTE_RE = re.compile(r"^ {0,3}>")
+UL_RE = re.compile(r"^ {0,3}[*+-][ ]+")
+OL_RE = re.compile(r"^ {0,3}\d+\.[ ]+")
+REF_RE = re.compile(r"^ {0,3}\[[^\]]+\]:[ ]*\S")
+
+
+def scan_blocks(text):
+    """Return (block_lines, heading_lines, total_lines): the 0-based source line where each
+    top-level Markdown block (and each heading) starts. It mirrors how Python-Markdown splits
+    a document; the preview checks the counts against the rendered page and falls back to
+    heading-only (then percentage) sync when they disagree, so being approximate is safe."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    n = len(lines)
+    starts, heads = [], []
+    last = None      # kind of the most recent top-level block
+    fresh = True     # the next non-blank line begins a new chunk
+    i = 0
+    while i < n:
+        ln = lines[i]
+        if not ln.strip():
+            fresh = True
+            i += 1
+            continue
+        if REF_RE.match(ln):          # link reference definitions render nothing
+            i += 1
+            continue
+        if fresh and ln.startswith("<!--"):   # a comment block renders no element
+            while i < n and "-->" not in lines[i]:
+                i += 1
+            i += 1
+            continue
+        m = FENCE_RE.match(ln)
+        if m:
+            j = i + 1
+            while j < n and lines[j].rstrip(" ") != m.group(1):
+                j += 1
+            if j < n:
+                starts.append(i)
+                last, fresh, i = "fence", True, j + 1
+                continue
+        if ATX_RE.match(ln):
+            starts.append(i)
+            heads.append(i)
+            last, fresh = "h", True
+            i += 1
+            continue
+        if HR_RE.match(ln):
+            starts.append(i)
+            last, fresh = "hr", True
+            i += 1
+            continue
+        if fresh:
+            if i + 1 < n and SETEXT_RE.match(lines[i + 1]) and not INDENT_RE.match(ln):
+                starts.append(i)
+                heads.append(i)
+                last, fresh = "h", True
+                i += 2
+                continue
+            if INDENT_RE.match(ln):
+                kind, merge = "code", last in ("code", "ul", "ol")
+            elif QUOTE_RE.match(ln):
+                kind, merge = "quote", last == "quote"
+            elif UL_RE.match(ln):
+                kind, merge = "ul", last == "ul"
+            elif OL_RE.match(ln):
+                kind, merge = "ol", last == "ol"
+            else:
+                kind, merge = "p", False
+            if not merge:
+                starts.append(i)
+                last = kind
+            fresh = False
+        i += 1
+    return starts, heads, n
+
+
+def tag_call(text):
+    blocks, heads, total = scan_blocks(text)
+    return "mdTag(%s,%s,%d);" % (json.dumps(blocks), json.dumps(heads), total)
+
+
+# ---------- find & replace (plain text or regular expressions) ----------
+MATCH_LIMIT = 5000
+
+
+def compile_query(text, regex, case):
+    """Compile the Find box into a pattern. Raises re.error for a bad regular expression."""
+    flags = re.MULTILINE | (0 if case else re.IGNORECASE)
+    return re.compile(text if regex else re.escape(text), flags)
+
+
+def find_spans(text, pat, limit=None):
+    """(start, end) of every non-empty match, as character offsets."""
+    out = []
+    for m in pat.finditer(text):
+        if m.end() > m.start():
+            out.append((m.start(), m.end()))
+            if limit and len(out) >= limit:
+                break
+    return out
+
+
+def next_span(text, pat, pos):
+    """First non-empty match starting at or after pos, wrapping around to the top."""
+    for p in (pos, 0):
+        while p <= len(text):
+            m = pat.search(text, p)
+            if not m:
+                break
+            if m.end() > m.start():
+                return m.start(), m.end()
+            p = m.end() + 1
+    return None
+
+
+def prev_span(text, pat, pos):
+    """Last non-empty match starting before pos, wrapping around to the bottom."""
+    spans = find_spans(text, pat, 100000)
+    if not spans:
+        return None
+    k = bisect.bisect_left([s for s, _ in spans], pos) - 1
+    return spans[k] if k >= 0 else spans[-1]
+
+
+def expand(m, repl, regex):
+    """Replacement text for match m. In regex mode \\1, \\g<name>, \\n work as in re.sub."""
+    return m.expand(repl) if regex else repl
+
+
+def replace_plan(text, pat, repl, regex):
+    """[(start, end, new_text)] for every match whose replacement actually changes the text."""
+    plan = []
+    for m in pat.finditer(text):
+        new = expand(m, repl, regex)
+        if new != m.group():
+            plan.append((m.start(), m.end(), new))
+    return plan
+
+
+# ---------- undo / redo ----------
+class UndoStack:
+    """Edit history. A group is a list of (kind, offset, text) ops, kind being "ins" or "del";
+    one group is one undo step. Typing and backspacing runs are merged into a single step."""
+    MERGE_SECS = 1.0
+    MAX_GROUPS = 1000
+
+    def __init__(self):
+        self.clear()
+
+    def clear(self):
+        self.undo, self.redo = [], []
+        self.pending, self.depth = [], 0
+        self.clean, self.seal, self.stamp = None, False, 0.0
+
+    def begin(self):          # GtkTextBuffer begin-user-action
+        self.depth += 1
+
+    def end(self, now):       # GtkTextBuffer end-user-action
+        if self.depth:
+            self.depth -= 1
+        if self.depth == 0 and self.pending:
+            ops, self.pending = self.pending, []
+            self._commit(ops, now)
+
+    def record(self, kind, offset, text, now):
+        if self.depth:
+            self.pending.append((kind, offset, text))
+        else:
+            self._commit([(kind, offset, text)], now)
+
+    def _commit(self, ops, now):
+        self.redo = []
+        top = self.undo[-1] if self.undo else None
+        if (top is not None and not self.seal and now - self.stamp < self.MERGE_SECS
+                and self._joins(top[-1], ops)):
+            top.extend(ops)
+        else:
+            self.undo.append(list(ops))
+            if len(self.undo) > self.MAX_GROUPS:
+                del self.undo[0]
+        self.seal, self.stamp = False, now
+
+    @staticmethod
+    def _joins(last, ops):
+        if len(ops) != 1:
+            return False
+        kind, off, text = ops[0]
+        lkind, loff, ltext = last
+        if kind != lkind or len(text) != 1 or len(ltext) != 1 or "\n" in (text, ltext):
+            return False
+        if kind == "ins":
+            return off == loff + 1
+        return off == loff or off + 1 == loff       # Delete key / Backspace
+
+    def pop_undo(self):
+        if not self.undo:
+            return None
+        group = self.undo.pop()
+        self.redo.append(group)
+        self.seal = True
+        return group
+
+    def pop_redo(self):
+        if not self.redo:
+            return None
+        group = self.redo.pop()
+        self.undo.append(group)
+        self.seal = True
+        return group
+
+    def mark_clean(self):     # called after a save
+        self.clean = self.undo[-1] if self.undo else None
+        self.seal = True
+
+    def is_clean(self):
+        return (self.undo[-1] if self.undo else None) is self.clean
+
+
+# ---------- Markdown syntax colouring for the editor ----------
+HL_MAX_CHARS = 400000
+SYN_TAGS = ("md-h", "md-code", "md-fence", "md-quote", "md-marker", "md-link", "md-hr",
+            "md-comment", "md-bold", "md-italic")
+PALETTE = {
+    False: {"md-h": "#0550ae", "md-code": "#953800", "md-fence": "#0a3069", "md-quote": "#59636e",
+            "md-marker": "#cf222e", "md-link": "#0969da", "md-hr": "#59636e", "md-comment": "#6e7781"},
+    True: {"md-h": "#79c0ff", "md-code": "#ffa657", "md-fence": "#a5d6ff", "md-quote": "#9198a1",
+           "md-marker": "#ff7b72", "md-link": "#4493f8", "md-hr": "#9198a1", "md-comment": "#9198a1"},
+}
+CODE_RE = re.compile(r"(`+).+?\1")
+BOLD_RE = re.compile(r"(\*\*|__)(?=\S).+?(?<=\S)\1")
+ITALIC_RE = re.compile(r"(?<![*\w])\*(?=[^\s*]).+?(?<=[^\s*])\*(?!\*)|(?<![_\w])_(?=[^\s_]).+?(?<=[^\s_])_(?![_\w])")
+LINK_RE = re.compile(r"!?\[[^\]\n]*\]\([^)\n]*\)|\[\[[^\]\n]+\]\]|<https?://[^>\s]+>|https?://[^\s)>]+")
+COMMENT_RE = re.compile(r"<!--.*?-->")
+MARKER_RE = re.compile(r"^[ \t]*([*+-]|\d+[.)])(?=[ \t])")
+
+
+def md_spans(text):
+    """[(tag_name, start, end)] character-offset spans to colour in the editor."""
+    out = []
+    lines = text.split("\n")
+    n = len(lines)
+    offs, o = [], 0
+    for ln in lines:
+        offs.append(o)
+        o += len(ln) + 1
+    i = 0
+    while i < n:
+        ln, base = lines[i], offs[i]
+        m = FENCE_RE.match(ln)
+        if m:
+            j = i + 1
+            while j < n and lines[j].rstrip(" ") != m.group(1):
+                j += 1
+            if j < n:
+                out.append(("md-fence", base, offs[j] + len(lines[j])))
+                i = j + 1
+                continue
+        if ATX_RE.match(ln):
+            out.append(("md-h", base, base + len(ln)))
+        elif HR_RE.match(ln):
+            out.append(("md-hr", base, base + len(ln)))
+        else:
+            if QUOTE_RE.match(ln):
+                out.append(("md-quote", base, base + len(ln)))
+            mk = MARKER_RE.match(ln)
+            if mk:
+                out.append(("md-marker", base + mk.start(1), base + mk.end(1)))
+        masked = ln
+        for m in CODE_RE.finditer(ln):
+            out.append(("md-code", base + m.start(), base + m.end()))
+            masked = masked[:m.start()] + " " * (m.end() - m.start()) + masked[m.end():]
+        for rx, tag in ((COMMENT_RE, "md-comment"), (LINK_RE, "md-link"),
+                        (BOLD_RE, "md-bold"), (ITALIC_RE, "md-italic")):
+            for m in rx.finditer(masked):
+                out.append((tag, base + m.start(), base + m.end()))
+        i += 1
+    return out
+
+
 def run(argv):
     import gi
     gi.require_version("Gtk", "3.0")
@@ -159,29 +489,264 @@ def run(argv):
         gi.require_version("WebKit2", "4.1")
     except ValueError:
         gi.require_version("WebKit2", "4.0")
-    from gi.repository import Gdk, Gio, GLib, Gtk, WebKit2
+    from gi.repository import Gdk, Gio, GLib, Gtk, Pango, WebKit2
 
     LABELS = {"auto": "◐ Auto", "light": "☀ Light", "dark": "🌙 Dark"}
+    CTRL, SHIFT, ALT = Gdk.ModifierType.CONTROL_MASK, Gdk.ModifierType.SHIFT_MASK, Gdk.ModifierType.MOD1_MASK
+
+    def iter_at_line(buf, n):
+        r = buf.get_iter_at_line(n)
+        return r[1] if isinstance(r, tuple) else r
+
+    class Doc:
+        """One open file: its editor, live preview, undo history and scroll-sync state."""
+
+        def __init__(self, win):
+            self.win = win
+            self.path, self.mtime = None, 0
+            self.dirty = self.loading = self.undoing = False
+            self.preview_id = self.hl_id = 0
+            self.lock, self.lock_until = None, 0.0
+            self.hist = UndoStack()
+            self.tab_box = self.tab_label = None
+
+            self.editor = Gtk.TextView()
+            self.editor.set_monospace(True)
+            self.editor.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+            self.editor.set_left_margin(12)
+            self.editor.set_right_margin(12)
+            self.editor.set_top_margin(10)
+            self.editor.set_bottom_margin(10)
+            self.buffer = self.editor.get_buffer()
+            for name in SYN_TAGS:
+                self.buffer.create_tag(name)
+            self.buffer.get_tag_table().lookup("md-h").set_property("weight", Pango.Weight.BOLD)
+            self.buffer.get_tag_table().lookup("md-marker").set_property("weight", Pango.Weight.BOLD)
+            self.buffer.get_tag_table().lookup("md-bold").set_property("weight", Pango.Weight.BOLD)
+            self.buffer.get_tag_table().lookup("md-italic").set_property("style", Pango.Style.ITALIC)
+            # created last so a find match is drawn on top of the syntax colours
+            self.match_tag = self.buffer.create_tag("match", background="#f2cc60", foreground="#000000")
+            self.apply_palette(win.is_dark())
+            self.buffer.connect("changed", self.on_changed)
+            self.buffer.connect("begin-user-action", lambda b: self.hist.begin())
+            self.buffer.connect("end-user-action", lambda b: self.hist.end(time.monotonic()))
+            self.buffer.connect_after("insert-text", self.on_insert)
+            self.buffer.connect("delete-range", self.on_delete)
+
+            self.editor_sw = Gtk.ScrolledWindow()
+            self.editor_sw.add(self.editor)
+            self.editor_sw.set_no_show_all(True)
+            self.editor_sw.get_vadjustment().connect("value-changed", self.on_editor_scroll)
+
+            ucm = WebKit2.UserContentManager()
+            ucm.register_script_message_handler("scroll")
+            ucm.connect("script-message-received::scroll", self.on_preview_scroll)
+            self.view = WebKit2.WebView.new_with_user_content_manager(ucm)
+            self.view.connect("decide-policy", self.on_policy)
+            self.view.get_find_controller().connect("counted-matches", lambda fc, n: win.on_counted(self, n))
+            self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+            self.paned.pack1(self.editor_sw, True, False)
+            self.paned.pack2(self.view, True, True)
+
+        def dispose(self):
+            for sid in (self.preview_id, self.hl_id):
+                if sid:
+                    GLib.source_remove(sid)
+            self.preview_id = self.hl_id = 0
+
+        # ---------- editor colouring ----------
+        def apply_palette(self, dark):
+            table = self.buffer.get_tag_table()
+            for name, color in PALETTE[dark].items():
+                table.lookup(name).set_property("foreground", color)
+
+        def run_highlight(self):
+            self.hl_id = 0
+            buf = self.buffer
+            start, end = buf.get_bounds()
+            for name in SYN_TAGS:
+                buf.remove_tag_by_name(name, start, end)
+            text = buf.get_text(start, end, True)
+            if len(text) <= HL_MAX_CHARS:
+                for name, a, b in md_spans(text)[:30000]:
+                    buf.apply_tag_by_name(name, buf.get_iter_at_offset(a), buf.get_iter_at_offset(b))
+            return False
+
+        # ---------- editing, undo and redo ----------
+        def on_insert(self, buf, it, text, length):
+            if not (self.loading or self.undoing):   # `it` is already past the inserted text
+                self.hist.record("ins", it.get_offset() - len(text), text, time.monotonic())
+
+        def on_delete(self, buf, start, end):
+            if not (self.loading or self.undoing):
+                self.hist.record("del", start.get_offset(), buf.get_text(start, end, True), time.monotonic())
+
+        def on_changed(self, buf):
+            if self.loading:
+                return
+            self.dirty = True
+            self.update_label()
+            self.win.on_doc_edited(self)
+            if self.preview_id:
+                GLib.source_remove(self.preview_id)
+            self.preview_id = GLib.timeout_add(250, self.live_preview)
+            if self.hl_id:
+                GLib.source_remove(self.hl_id)
+            self.hl_id = GLib.timeout_add(150, self.run_highlight)
+
+        def step_history(self, undo):
+            group = self.hist.pop_undo() if undo else self.hist.pop_redo()
+            if group is None:
+                return
+            buf, pos = self.buffer, 0
+            self.undoing = True
+            try:
+                for kind, off, text in (reversed(group) if undo else group):
+                    if (kind == "ins") != undo:       # undoing a delete / redoing an insert
+                        buf.insert(buf.get_iter_at_offset(off), text)
+                        pos = off + len(text)
+                    else:
+                        buf.delete(buf.get_iter_at_offset(off), buf.get_iter_at_offset(off + len(text)))
+                        pos = off
+            finally:
+                self.undoing = False
+            it = buf.get_iter_at_offset(pos)
+            buf.place_cursor(it)
+            self.editor.scroll_to_iter(it, 0.1, False, 0, 0)
+            self.dirty = not self.hist.is_clean()
+            self.update_label()
+
+        def live_preview(self):  # swap the rendered body in place so scroll position is kept
+            self.preview_id = 0
+            start, end = self.buffer.get_bounds()
+            text = self.buffer.get_text(start, end, True)
+            js = ("var a=document.querySelector('article'); if(a){a.innerHTML=%s;%s}"
+                  % (json.dumps(render_body(text)), tag_call(text)))
+            self.view.run_javascript(js, None, None, None)
+            return False
+
+        def update_label(self):
+            self.win.refresh_tab(self)
+
+        def save(self):
+            if not self.path:
+                return
+            start, end = self.buffer.get_bounds()
+            try:
+                with open(self.path, "w", encoding="utf-8") as f:
+                    f.write(self.buffer.get_text(start, end, True))
+                self.mtime = os.path.getmtime(self.path)
+            except OSError as e:
+                self.win.message(f"Could not save: {e}")
+                return
+            self.dirty = False
+            self.hist.mark_clean()
+            self.update_label()
+
+        # ---------- loading ----------
+        def load(self, path):
+            path = os.path.abspath(path)
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+                self.mtime = os.path.getmtime(path)
+            except OSError as e:
+                text, self.mtime = f"# Cannot open file\n\n{e}", 0
+            self.path = path
+            for sid in (self.preview_id, self.hl_id):
+                if sid:
+                    GLib.source_remove(sid)
+            self.preview_id = self.hl_id = 0
+            self.loading = True
+            self.buffer.set_text(text)
+            self.loading = False
+            self.hist.clear()
+            self.dirty = False
+            self.update_label()
+            self.view.load_html(render(text, os.path.basename(path), self.win.theme),
+                                Gio.File.new_for_path(path).get_uri())
+            self.run_highlight()
+
+        def on_policy(self, view, decision, dtype):
+            if dtype != WebKit2.PolicyDecisionType.NAVIGATION_ACTION:
+                return False
+            uri = decision.get_navigation_action().get_request().get_uri()
+            base = Gio.File.new_for_path(self.path).get_uri() if self.path else ""
+            if uri.startswith("about:") or uri == base or uri.startswith(base + "#"):
+                return False
+            if uri.startswith("file://"):
+                p = GLib.filename_from_uri(uri.split("#")[0])[0]
+                if p.lower().endswith((".md", ".markdown")):
+                    decision.ignore()
+                    self.win.open_path(p)   # opens in a tab, or switches to it if already open
+                    return True
+            decision.ignore()
+            Gio.AppInfo.launch_default_for_uri(uri, None)
+            return True
+
+        # ---------- synchronized scrolling (line based, see mdTag/mdScroll in JS) ----------
+        def locked(self, who):  # ignore the echo of a scroll we just caused ourselves
+            return self.lock == who and time.monotonic() < self.lock_until
+
+        def top_line(self):
+            """Fractional 0-based source line at the top of the editor viewport."""
+            y = int(self.editor_sw.get_vadjustment().get_value())
+            it, _ = self.editor.get_line_at_y(y)
+            ly, lh = self.editor.get_line_yrange(it)
+            frac = min(1.0, max(0.0, (y - ly) / lh)) if lh > 0 else 0.0
+            return it.get_line() + frac
+
+        def on_editor_scroll(self, adj):
+            if not self.editor_sw.get_visible() or self.locked("preview"):
+                return
+            self.lock, self.lock_until = "editor", time.monotonic() + 0.25
+            rng = adj.get_upper() - adj.get_page_size()
+            ratio = min(1.0, max(0.0, adj.get_value() / rng)) if rng > 0 else 0.0
+            self.view.run_javascript("mdScroll(%f,%f)" % (self.top_line(), ratio), None, None, None)
+
+        def on_preview_scroll(self, ucm, result):
+            if not self.editor_sw.get_visible() or self.locked("editor"):
+                return
+            val = result.get_js_value() if hasattr(result, "get_js_value") else result
+            try:
+                data = json.loads(val.to_string())
+                ratio = min(1.0, max(0.0, float(data.get("ratio", 0))))
+                line = max(0.0, float(data.get("line", 0)))
+            except (ValueError, TypeError, AttributeError):
+                return
+            adj = self.editor_sw.get_vadjustment()
+            rng = adj.get_upper() - adj.get_page_size()
+            if rng <= 0:
+                return
+            y = ratio * rng
+            if data.get("ok"):
+                ln = int(line)
+                last = self.buffer.get_line_count() - 1
+                frac = line - ln if ln <= last else 0.0
+                ly, lh = self.editor.get_line_yrange(iter_at_line(self.buffer, min(ln, last)))
+                w = max(0.0, min(1.0, (ratio - 0.9) * 10 + 1e-9))   # glide to the true end of the editor
+                y = (ly + frac * lh) * (1 - w) + y * w
+            self.lock, self.lock_until = "preview", time.monotonic() + 0.25
+            adj.set_value(max(0.0, min(rng, y)))
 
     class Viewer(Gtk.Window):
         def __init__(self):
             super().__init__(title="mdview")
             self.set_default_size(1100, 800)
-            self.path = None
-            self.mtime = 0
             self.theme = load_theme()
-            self.dirty = False
-            self.loading = False
-            self.preview_id = 0
+            self.docs, self.mru, self.doc = [], [], None   # open tabs, most-recently-used order, current
+            self.switching, self.sw_list, self.sw_i = False, [], 0
+            self.find_idle, self.flash, self._dark = 0, None, None
 
             hb = Gtk.HeaderBar(show_close_button=True, title="mdview")
             self.set_titlebar(hb)
             open_btn = Gtk.Button(label="Open")
+            open_btn.set_tooltip_text("Open a file in a new tab (Ctrl+O)")
             open_btn.connect("clicked", lambda *a: self.open_dialog())
             hb.pack_start(open_btn)
             self.edit_btn = Gtk.ToggleButton(label="✎ Edit")
             self.edit_btn.set_tooltip_text("Edit this file with live preview (Ctrl+E)")
-            self.edit_btn.connect("toggled", self.on_edit_toggled)
+            self.edit_hid = self.edit_btn.connect("toggled", self.on_edit_toggled)
             hb.pack_start(self.edit_btn)
             self.save_btn = Gtk.Button(label="💾 Save")
             self.save_btn.set_tooltip_text("Save (Ctrl+S)")
@@ -193,55 +758,62 @@ def run(argv):
             self.theme_btn.connect("clicked", lambda *a: self.cycle_theme())
             hb.pack_end(self.theme_btn)
 
-            # editor (left, hidden until Edit is on) + preview (right)
-            self.editor = Gtk.TextView()
-            self.editor.set_monospace(True)
-            self.editor.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-            self.editor.set_left_margin(12)
-            self.editor.set_right_margin(12)
-            self.editor.set_top_margin(10)
-            self.editor.set_bottom_margin(10)
-            self.buffer = self.editor.get_buffer()
-            self.buffer.connect("changed", self.on_changed)
-            self.editor_sw = Gtk.ScrolledWindow()
-            self.editor_sw.add(self.editor)
-            self.editor_sw.set_no_show_all(True)
-            self.editor_sw.get_vadjustment().connect("value-changed", self.on_editor_scroll)
-            self.lock, self.lock_until = None, 0.0
-
-            ucm = WebKit2.UserContentManager()
-            ucm.register_script_message_handler("scroll")
-            ucm.connect("script-message-received::scroll", self.on_preview_scroll)
-            self.view = WebKit2.WebView.new_with_user_content_manager(ucm)
-            self.view.connect("decide-policy", self.on_policy)
-            self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-            self.paned.pack1(self.editor_sw, True, False)
-            self.paned.pack2(self.view, True, True)
-            self.find_idle, self.flash = 0, None
+            # one notebook page per file; the tab bar only appears once a second file is open
+            self.notebook = Gtk.Notebook()
+            self.notebook.set_scrollable(True)
+            self.notebook.set_show_tabs(False)
+            self.notebook.connect("switch-page", self.on_switch_page)
+            overlay = Gtk.Overlay()
+            overlay.add(self.notebook)
+            overlay.add_overlay(self.build_switcher())
+            overlay.set_overlay_pass_through(self.switcher, True)
             vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-            vbox.pack_start(self.paned, True, True, 0)
+            vbox.pack_start(overlay, True, True, 0)
             vbox.pack_start(self.build_findbar(), False, False, 0)
             self.add(vbox)
 
             ag = Gtk.AccelGroup()
             self.add_accel_group(ag)
-            shortcuts = (("o", self.open_dialog), ("r", lambda: self.load(self.path, force=True)),
-                         ("d", self.cycle_theme), ("s", self.save),
+            shortcuts = (("o", self.open_dialog), ("r", self.reload), ("d", self.cycle_theme), ("s", self.save),
                          ("e", lambda: self.edit_btn.set_active(not self.edit_btn.get_active())),
                          ("f", self.open_find), ("h", lambda: self.open_find(True)),
-                         ("q", self.close))
+                         ("w", self.close_current), ("q", self.close))
             for key, fn in shortcuts:
                 k, mod = Gtk.accelerator_parse("<Control>" + key)
                 ag.connect(k, mod, 0, lambda *a, fn=fn: fn() or True)
             for accel, back in (("F3", False), ("<Shift>F3", True)):
                 k, mod = Gtk.accelerator_parse(accel)
                 ag.connect(k, mod, 0, lambda *a, back=back: self.find_step(back) or True)
+            for accel, redo in (("<Control>z", False), ("<Control>y", True), ("<Control><Shift>z", True)):
+                k, mod = Gtk.accelerator_parse(accel)
+                ag.connect(k, mod, 0, lambda *a, redo=redo: self.history(redo))
             self.sync_theme_ui()
             GLib.timeout_add(1000, self.poll)
-            self.connect("delete-event", lambda *a: not self.confirm_discard())
+            self.connect("key-press-event", self.on_key_press)
+            self.connect("key-release-event", self.on_key_release)
+            self.connect("focus-out-event", lambda *a: self.mru_commit() or False)
+            self.connect("style-updated", lambda *a: self.refresh_palette())
+            self.connect("delete-event", lambda *a: not self.confirm_all())
             self.connect("destroy", Gtk.main_quit)
 
         # ---------- theme ----------
+        def is_dark(self):
+            if self.theme != "auto":
+                return self.theme == "dark"
+            ctx = self.get_style_context()
+            for name in ("theme_base_color", "theme_bg_color"):
+                ok, c = ctx.lookup_color(name)
+                if ok:
+                    return 0.299 * c.red + 0.587 * c.green + 0.114 * c.blue < 0.5
+            return False
+
+        def refresh_palette(self):
+            dark = self.is_dark()
+            if dark != self._dark:
+                self._dark = dark
+                for d in self.docs:
+                    d.apply_palette(dark)
+
         def sync_theme_ui(self):
             self.theme_btn.set_label(LABELS[self.theme])
             gs = Gtk.Settings.get_default()
@@ -258,83 +830,272 @@ def run(argv):
                 js = "document.documentElement.removeAttribute('data-theme')"
             else:
                 js = f"document.documentElement.setAttribute('data-theme','{self.theme}')"
-            self.view.run_javascript(js, None, None, None)  # no reload: scroll position is kept
+            for d in self.docs:
+                d.view.run_javascript(js, None, None, None)  # no reload: scroll position is kept
+            GLib.idle_add(lambda: self.refresh_palette() or False)  # once GTK has restyled
 
-        # ---------- editing ----------
-        def update_title(self):
-            name = os.path.basename(self.path) if self.path else "mdview"
-            self.set_title(f"{'● ' if self.dirty else ''}{name} - mdview")
+        # ---------- tabs ----------
+        def make_tab_label(self, d):
+            d.tab_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            d.tab_label = Gtk.Label()
+            d.tab_label.set_ellipsize(Pango.EllipsizeMode.END)
+            d.tab_label.set_max_width_chars(24)
+            close = Gtk.Button()
+            close.set_relief(Gtk.ReliefStyle.NONE)
+            close.set_focus_on_click(False)
+            close.set_tooltip_text("Close tab (Ctrl+W)")
+            close.add(Gtk.Image.new_from_icon_name("window-close-symbolic", Gtk.IconSize.MENU))
+            close.connect("clicked", lambda *a: self.close_doc(d))
+            d.tab_box.pack_start(d.tab_label, True, True, 0)
+            d.tab_box.pack_start(close, False, False, 0)
+            d.tab_box.show_all()
 
-        def on_edit_toggled(self, btn):
-            if btn.get_active():
-                self.editor.show()
-                self.editor_sw.show()
-                self.save_btn.show()
-                self.paned.set_position(max(300, self.get_allocated_width() // 2))
-                self.editor.grab_focus()
-            else:
-                self.editor_sw.hide()
-                self.save_btn.hide()
+        def refresh_tab(self, d):
+            name = os.path.basename(d.path) if d.path else "untitled"
+            mark = "● " if d.dirty else ""
+            if d.tab_label is not None:
+                d.tab_label.set_text(mark + name)
+                d.tab_box.set_tooltip_text(d.path or name)
+            if d is self.doc:
+                self.set_title(f"{mark}{name} - mdview")
+
+        def doc_for(self, page):
+            for d in self.docs:
+                if d.paned == page:
+                    return d
+            return None
+
+        def add_doc(self):
+            d = Doc(self)
+            self.make_tab_label(d)
+            self.docs.append(d)
+            self.notebook.append_page(d.paned, d.tab_box)
+            self.notebook.set_tab_reorderable(d.paned, True)
+            d.paned.show_all()   # the editor pane stays hidden until Edit is switched on
+            self.notebook.set_show_tabs(len(self.docs) > 1)
+            self.select(d)
+            if self.doc is None:   # GTK did not announce the very first page
+                self.on_switch_page(self.notebook, d.paned, 0)
+            return d
+
+        def select(self, d):
+            self.notebook.set_current_page(self.notebook.page_num(d.paned))
+
+        def touch(self, d):  # d becomes the most recently used tab
+            if d in self.mru:
+                self.mru.remove(d)
+            self.mru.insert(0, d)
+
+        def on_switch_page(self, nb, page, num):
+            d = self.doc_for(page)
+            if d is None or d is self.doc:
+                return
+            if self.doc is not None:
+                self.clear_matches(self.doc)
+            self.doc = d
+            self.touch(d)
+            self.sync_chrome()
+
+        def sync_chrome(self):
+            d = self.doc
+            editing = d.editor_sw.get_visible()
+            self.edit_btn.handler_block(self.edit_hid)
+            self.edit_btn.set_active(editing)
+            self.edit_btn.handler_unblock(self.edit_hid)
+            self.save_btn.set_visible(editing)
+            self.refresh_tab(d)
+            self.update_find_ui()
             self.refresh_find_context()
 
-        def on_changed(self, buf):
-            if self.loading:
-                return
-            self.dirty = True
-            self.update_title()
-            if self.findbar.get_visible() and self.edit_btn.get_active():
-                self.schedule_find_update()
-            if self.preview_id:
-                GLib.source_remove(self.preview_id)
-            self.preview_id = GLib.timeout_add(250, self.live_preview)
+        def open_path(self, path):
+            path = os.path.realpath(path)
+            for d in self.docs:
+                if d.path and os.path.realpath(d.path) == path:
+                    self.select(d)
+                    return d
+            d = self.add_doc()
+            d.load(path)
+            return d
 
-        def live_preview(self):  # swap the rendered body in place so scroll position is kept
-            self.preview_id = 0
-            start, end = self.buffer.get_bounds()
-            body = render_body(self.buffer.get_text(start, end, True))
-            js = ("var a=document.querySelector('article'); if(a){a.innerHTML=%s;}" % json.dumps(body))
-            self.view.run_javascript(js, None, None, None)
-            return False
+        def close_current(self):
+            if self.doc is not None:
+                self.close_doc(self.doc)
 
-        def save(self):
-            if not self.path:
+        def close_doc(self, d):
+            if not self.confirm_discard(d):
                 return
-            start, end = self.buffer.get_bounds()
-            try:
-                with open(self.path, "w", encoding="utf-8") as f:
-                    f.write(self.buffer.get_text(start, end, True))
-                self.mtime = os.path.getmtime(self.path)
-            except OSError as e:
-                self.message(f"Could not save: {e}")
+            if len(self.docs) == 1:
+                self.destroy()
                 return
-            self.dirty = False
-            self.update_title()
+            self.docs.remove(d)
+            self.mru.remove(d)
+            if d is self.doc:
+                self.select(self.mru[0])   # fall back to the most recently used tab
+            self.notebook.remove_page(self.notebook.page_num(d.paned))
+            self.notebook.set_show_tabs(len(self.docs) > 1)
+            d.dispose()
+
+        def step_tab(self, delta):  # plain left/right order, as shown on the tab bar
+            n = self.notebook.get_n_pages()
+            if n > 1:
+                self.notebook.set_current_page((self.notebook.get_current_page() + delta) % n)
+
+        def confirm_discard(self, d):
+            """True if it is OK to close this document."""
+            if not d.dirty:
+                return True
+            self.select(d)
+            name = os.path.basename(d.path) if d.path else "untitled"
+            dlg = Gtk.MessageDialog(parent=self, modal=True, message_type=Gtk.MessageType.QUESTION,
+                                    text=f"Save changes to {name}?")
+            dlg.format_secondary_text("Your changes will be lost if you don't save them.")
+            dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Discard", Gtk.ResponseType.REJECT,
+                            "Save", Gtk.ResponseType.ACCEPT)
+            r = dlg.run()
+            dlg.destroy()
+            if r == Gtk.ResponseType.ACCEPT:
+                d.save()
+                return not d.dirty
+            return r == Gtk.ResponseType.REJECT
+
+        def confirm_all(self):
+            return all(self.confirm_discard(d) for d in list(self.docs))
 
         def message(self, text):
-            d = Gtk.MessageDialog(parent=self, modal=True, message_type=Gtk.MessageType.ERROR,
-                                  buttons=Gtk.ButtonsType.OK, text=text)
-            d.run()
-            d.destroy()
+            dlg = Gtk.MessageDialog(parent=self, modal=True, message_type=Gtk.MessageType.ERROR,
+                                    buttons=Gtk.ButtonsType.OK, text=text)
+            dlg.run()
+            dlg.destroy()
 
-        def confirm_discard(self):
-            """True if it is OK to replace/close the current document."""
-            if not self.dirty:
+        # ---------- most-recently-used tab switching (Ctrl+Tab) ----------
+        def build_switcher(self):
+            self.switcher = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            self.switcher.set_name("mdview-switcher")
+            self.switcher.set_halign(Gtk.Align.CENTER)
+            self.switcher.set_valign(Gtk.Align.CENTER)
+            self.switcher.set_no_show_all(True)
+            self.switcher.hide()
+            css = Gtk.CssProvider()
+            try:
+                css.load_from_data(b"#mdview-switcher { background: rgba(32,34,38,0.95); color: #ffffff;"
+                                   b" border-radius: 8px; padding: 8px; }"
+                                   b"#mdview-switcher label { padding: 4px 14px; border-radius: 5px; }"
+                                   b"#mdview-switcher label.sel { background: #0969da; }")
+                Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css,
+                                                         Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            except GLib.Error:
+                pass
+            return self.switcher
+
+        def mru_step(self, delta):
+            """Ctrl+Tab walks back through the tabs in most-recently-used order and Ctrl+Shift+Tab
+            walks forward again. Nothing is switched until Ctrl is released."""
+            if len(self.mru) < 2:
+                return
+            if not self.switching:
+                self.switching, self.sw_list, self.sw_i = True, list(self.mru), 0
+            self.sw_i = (self.sw_i + delta) % len(self.sw_list)
+            self.mru_show()
+
+        def mru_show(self):
+            for child in self.switcher.get_children():
+                self.switcher.remove(child)
+            home = os.path.expanduser("~")
+            lo = max(0, min(self.sw_i - 7, len(self.sw_list) - 15))
+            for i in range(lo, min(len(self.sw_list), lo + 15)):
+                d = self.sw_list[i]
+                name = os.path.basename(d.path) if d.path else "untitled"
+                where = os.path.dirname(d.path) if d.path else ""
+                if where.startswith(home):
+                    where = "~" + where[len(home):]
+                lbl = Gtk.Label()
+                lbl.set_xalign(0)
+                lbl.set_markup("%s%s   <small>%s</small>" % ("● " if d.dirty else "",
+                                                            htmlmod.escape(name, quote=False),
+                                                            htmlmod.escape(where, quote=False)))
+                if i == self.sw_i:
+                    lbl.get_style_context().add_class("sel")
+                self.switcher.pack_start(lbl, False, False, 0)
+                lbl.show()
+            self.switcher.show()
+
+        def mru_commit(self):
+            if not self.switching:
+                return
+            self.switching = False
+            self.switcher.hide()
+            target = self.sw_list[self.sw_i]
+            if target in self.docs and target is not self.doc:
+                self.select(target)
+
+        def mru_cancel(self):
+            self.switching = False
+            self.switcher.hide()
+
+        def on_key_press(self, win, ev):
+            state = ev.state & Gtk.accelerator_get_default_mod_mask()
+            key = ev.keyval
+            if state & CTRL and key in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab, Gdk.KEY_KP_Tab):
+                back = key == Gdk.KEY_ISO_Left_Tab or bool(state & SHIFT)
+                self.mru_step(-1 if back else 1)
                 return True
-            d = Gtk.MessageDialog(parent=self, modal=True, message_type=Gtk.MessageType.QUESTION,
-                                  text="Save changes before continuing?")
-            d.format_secondary_text("Your changes will be lost if you don't save them.")
-            d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Discard", Gtk.ResponseType.REJECT,
-                          "Save", Gtk.ResponseType.ACCEPT)
-            r = d.run()
-            d.destroy()
-            if r == Gtk.ResponseType.ACCEPT:
-                self.save()
-                return not self.dirty
-            return r == Gtk.ResponseType.REJECT
+            if self.switching and key == Gdk.KEY_Escape:
+                self.mru_cancel()
+                return True
+            if state == CTRL and key in (Gdk.KEY_Page_Down, Gdk.KEY_Page_Up):
+                self.step_tab(1 if key == Gdk.KEY_Page_Down else -1)
+                return True
+            if state == ALT and Gdk.KEY_1 <= key <= Gdk.KEY_9:
+                n = key - Gdk.KEY_1
+                if n < self.notebook.get_n_pages():
+                    self.notebook.set_current_page(n)
+                return True
+            return False
+
+        def on_key_release(self, win, ev):
+            if ev.keyval in (Gdk.KEY_Control_L, Gdk.KEY_Control_R):
+                self.mru_commit()
+            return False
+
+        # ---------- editing ----------
+        def on_edit_toggled(self, btn):
+            d = self.doc
+            if d is None:
+                return
+            if btn.get_active():
+                d.editor.show()
+                d.editor_sw.show()
+                self.save_btn.show()
+                d.paned.set_position(max(300, self.get_allocated_width() // 2))
+                d.editor.grab_focus()
+            else:
+                d.editor_sw.hide()
+                self.save_btn.hide()
+            self.update_find_ui()
+            self.refresh_find_context()
+
+        def save(self):
+            if self.doc is not None:
+                self.doc.save()
+
+        def reload(self):
+            if self.doc is not None and self.doc.path:
+                self.doc.load(self.doc.path)
+
+        def history(self, redo):
+            """Ctrl+Z / Ctrl+Y: only while the editor has focus, so text fields keep their own keys."""
+            d = self.doc
+            if d is None or not d.editor.has_focus():
+                return False
+            d.step_history(not redo)
+            return True
+
+        def on_doc_edited(self, d):
+            if d is self.doc and self.findbar.get_visible() and self.editing():
+                self.schedule_find_update()
 
         # ---------- find & replace ----------
         def build_findbar(self):
-            self.match_tag = self.buffer.create_tag("match", background="#f2cc60", foreground="#000000")
             self.findbar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
             self.findbar.set_border_width(6)
 
@@ -356,11 +1117,15 @@ def run(argv):
             next_btn.connect("clicked", lambda *a: self.find_step(False))
             self.case_chk = Gtk.CheckButton(label="Match case")
             self.case_chk.connect("toggled", lambda *a: self.on_find_changed())
+            self.regex_chk = Gtk.CheckButton(label="Regex")
+            self.regex_chk.set_tooltip_text("Regular expression (edit mode). In Replace, \\1 and \\g<name> "
+                                            "refer to groups and \\n is a newline.")
+            self.regex_chk.connect("toggled", lambda *a: self.on_find_changed())
             self.count_lbl = Gtk.Label(label="")
             close_btn = Gtk.Button(label="✕")
             close_btn.set_relief(Gtk.ReliefStyle.NONE)
             close_btn.connect("clicked", lambda *a: self.close_find())
-            for w in (self.find_entry, prev_btn, next_btn, self.case_chk, self.count_lbl):
+            for w in (self.find_entry, prev_btn, next_btn, self.case_chk, self.regex_chk, self.count_lbl):
                 row1.pack_start(w, False, False, 0)
             row1.pack_end(close_btn, False, False, 0)
 
@@ -393,27 +1158,39 @@ def run(argv):
         def case_sensitive(self):
             return self.case_chk.get_active()
 
-        def text_flags(self):
-            f = Gtk.TextSearchFlags.TEXT_ONLY
-            if not self.case_sensitive():
-                f |= Gtk.TextSearchFlags.CASE_INSENSITIVE
-            return f
-
         def web_opts(self):
             o = WebKit2.FindOptions.WRAP_AROUND
             if not self.case_sensitive():
                 o |= WebKit2.FindOptions.CASE_INSENSITIVE
             return o
 
+        def update_find_ui(self):
+            self.regex_chk.set_sensitive(self.editing())   # the preview's search is plain text only
+
+        def compile_find(self, text):
+            """(pattern, None) for the Find box, or (None, message) when the regex is invalid."""
+            try:
+                return compile_query(text, self.regex_chk.get_active() and self.editing(),
+                                     self.case_sensitive()), None
+            except re.error:
+                return None, "Invalid regex"
+
+        def replacement(self, m):
+            return expand(m, self.replace_entry.get_text(), self.regex_chk.get_active())
+
         def open_find(self, replace=False):
+            d = self.doc
+            if d is None:
+                return
             if replace and not self.editing():
                 self.edit_btn.set_active(True)  # replacing needs the editor
             self.findbar.show()
+            self.update_find_ui()
             if self.editing():
                 self.replace_row.show()
-                if self.buffer.get_has_selection():
-                    a, b = self.buffer.get_selection_bounds()
-                    sel = self.buffer.get_text(a, b, True)
+                if d.buffer.get_has_selection():
+                    a, b = d.buffer.get_selection_bounds()
+                    sel = d.buffer.get_text(a, b, True)
                     if sel and "\n" not in sel:
                         self.find_entry.set_text(sel)
             else:
@@ -425,16 +1202,19 @@ def run(argv):
         def close_find(self):
             self.findbar.hide()
             self.clear_matches()
-            if self.editing():
-                self.editor.grab_focus()
+            if self.editing() and self.doc is not None:
+                self.doc.editor.grab_focus()
 
-        def clear_matches(self):
-            start, end = self.buffer.get_bounds()
-            self.buffer.remove_tag(self.match_tag, start, end)
-            self.view.get_find_controller().search_finish()
+        def clear_matches(self, d=None):
+            d = d or self.doc
+            if d is None:
+                return
+            start, end = d.buffer.get_bounds()
+            d.buffer.remove_tag(d.match_tag, start, end)
+            d.view.get_find_controller().search_finish()
 
         def refresh_find_context(self):
-            if not self.findbar.get_visible():
+            if not self.findbar.get_visible() or self.doc is None:
                 return
             if self.editing():
                 self.replace_row.show()
@@ -454,26 +1234,27 @@ def run(argv):
             return False
 
         def on_find_changed(self):
+            d = self.doc
+            if d is None:
+                return
             text = self.find_entry.get_text()
             if self.editing():
                 self.update_editor_matches()
                 if text:
                     self.find_step(False, keep=True)
             else:
-                fc = self.view.get_find_controller()
+                fc = d.view.get_find_controller()
                 if text:
                     fc.search(text, self.web_opts(), 1000)
                     self.count_lbl.set_text("")
-                    if not getattr(self, "_cm", False):
-                        fc.connect("counted-matches", self.on_counted)
-                        self._cm = True
                     fc.count_matches(text, self.web_opts(), 1000)
                 else:
                     fc.search_finish()
                     self.count_lbl.set_text("")
 
-        def on_counted(self, fc, n):
-            self.count_lbl.set_text(f"{n} found" if n else "No results")
+        def on_counted(self, d, n):
+            if d is self.doc and not self.editing():
+                self.count_lbl.set_text(f"{n} found" if n else "No results")
 
         def schedule_find_update(self):
             if not self.find_idle:
@@ -481,186 +1262,151 @@ def run(argv):
 
         def do_find_update(self):
             self.find_idle = 0
-            if self.findbar.get_visible() and self.editing():
+            if self.doc is not None and self.findbar.get_visible() and self.editing():
                 self.update_editor_matches()
             return False
 
         def update_editor_matches(self):
-            start, end = self.buffer.get_bounds()
-            self.buffer.remove_tag(self.match_tag, start, end)
+            d = self.doc
+            start, end = d.buffer.get_bounds()
+            d.buffer.remove_tag(d.match_tag, start, end)
             text = self.find_entry.get_text()
             flash, self.flash = self.flash, None  # one-time message such as "Replaced 3"
             if not text:
                 self.count_lbl.set_text(flash or "")
                 return
-            count, it, flags = 0, start, self.text_flags()
-            while count < 5000:
-                m = it.forward_search(text, flags, None)
-                if not m:
-                    break
-                self.buffer.apply_tag(self.match_tag, m[0], m[1])
-                count += 1
-                it = m[1]
-            self.count_lbl.set_text(flash or (f"{count} found" if count else "No results"))
+            pat, err = self.compile_find(text)
+            if err:
+                self.count_lbl.set_text(err)
+                return
+            spans = find_spans(d.buffer.get_text(start, end, True), pat, MATCH_LIMIT + 1)
+            for a, b in spans[:MATCH_LIMIT]:
+                d.buffer.apply_tag(d.match_tag, d.buffer.get_iter_at_offset(a), d.buffer.get_iter_at_offset(b))
+            if len(spans) > MATCH_LIMIT:
+                summary = f"{MATCH_LIMIT}+ found"
+            else:
+                summary = f"{len(spans)} found" if spans else "No results"
+            self.count_lbl.set_text(flash or summary)
 
         def find_step(self, backwards=False, keep=False):
             text = self.find_entry.get_text()
-            if not text:
+            d = self.doc
+            if not text or d is None:
                 return
             if not self.editing():
-                fc = self.view.get_find_controller()
+                fc = d.view.get_find_controller()
                 fc.search_previous() if backwards else fc.search_next()
                 return
-            buf, flags = self.buffer, self.text_flags()
+            pat, err = self.compile_find(text)
+            if err:
+                self.count_lbl.set_text(err)
+                return
+            buf = d.buffer
+            body = buf.get_text(*buf.get_bounds(), True)
             if buf.get_has_selection():
-                sel_s, sel_e = buf.get_selection_bounds()
+                sel_s, sel_e = (it.get_offset() for it in buf.get_selection_bounds())
             else:
-                sel_s = sel_e = buf.get_iter_at_mark(buf.get_insert())
+                sel_s = sel_e = buf.get_iter_at_mark(buf.get_insert()).get_offset()
             if backwards:
-                m = sel_s.backward_search(text, flags, None) or buf.get_end_iter().backward_search(text, flags, None)
+                span = prev_span(body, pat, sel_s)
             else:
-                origin = sel_s if keep else sel_e
-                m = origin.forward_search(text, flags, None) or buf.get_start_iter().forward_search(text, flags, None)
-            if m:
-                buf.select_range(m[1], m[0])
-                self.editor.scroll_to_iter(m[0], 0.15, False, 0, 0)
+                span = next_span(body, pat, sel_s if keep else sel_e)
+            if span:
+                a, b = buf.get_iter_at_offset(span[0]), buf.get_iter_at_offset(span[1])
+                buf.select_range(b, a)
+                d.editor.scroll_to_iter(a, 0.15, False, 0, 0)
 
         def replace_current(self):
-            if not self.editing():
+            d = self.doc
+            if d is None or not self.editing():
                 return
-            text, repl, buf = self.find_entry.get_text(), self.replace_entry.get_text(), self.buffer
+            text, buf = self.find_entry.get_text(), d.buffer
             if not text:
+                return
+            pat, err = self.compile_find(text)
+            if err:
+                self.count_lbl.set_text(err)
                 return
             if buf.get_has_selection():
                 a, b = buf.get_selection_bounds()
-                sel = buf.get_text(a, b, True)
-                same = sel == text if self.case_sensitive() else sel.lower() == text.lower()
-                if same:
+                so, eo = a.get_offset(), b.get_offset()
+                m = pat.match(buf.get_text(*buf.get_bounds(), True), so)
+                if m and m.end() == eo and eo > so:   # the selection is exactly a match
+                    try:
+                        new = self.replacement(m)
+                    except (re.error, IndexError):
+                        self.count_lbl.set_text("Invalid replacement")
+                        return
                     buf.begin_user_action()
                     buf.delete(a, b)
-                    buf.insert(a, repl)
+                    buf.insert(a, new)
                     buf.end_user_action()
             self.find_step(False)
             self.schedule_find_update()
 
         def replace_all(self):
-            if not self.editing():
+            d = self.doc
+            if d is None or not self.editing():
                 return
-            text, repl, buf = self.find_entry.get_text(), self.replace_entry.get_text(), self.buffer
+            text, buf = self.find_entry.get_text(), d.buffer
             if not text:
                 return
-            flags, spans, it = self.text_flags(), [], buf.get_start_iter()
-            while True:
-                m = it.forward_search(text, flags, None)
-                if not m:
-                    break
-                spans.append((m[0].get_offset(), m[1].get_offset()))
-                it = m[1]
-            if not spans:
+            pat, err = self.compile_find(text)
+            if err:
+                self.count_lbl.set_text(err)
+                return
+            body = buf.get_text(*buf.get_bounds(), True)
+            repl, regex = self.replace_entry.get_text(), self.regex_chk.get_active()
+            try:
+                plan = replace_plan(body, pat, repl, regex)
+            except (re.error, IndexError):
+                self.count_lbl.set_text("Invalid replacement")
+                return
+            if not plan:
                 self.count_lbl.set_text("No results")
                 return
             buf.begin_user_action()
-            for so, eo in reversed(spans):  # back to front so earlier offsets stay valid
+            for so, eo, new in reversed(plan):  # back to front so earlier offsets stay valid
                 a, b = buf.get_iter_at_offset(so), buf.get_iter_at_offset(eo)
                 buf.delete(a, b)
-                buf.insert(a, repl)
+                buf.insert(a, new)
             buf.end_user_action()
-            self.flash = f"Replaced {len(spans)}"
+            self.flash = f"Replaced {len(plan)}"
             self.schedule_find_update()
 
-        # ---------- synchronized scrolling ----------
-        def locked(self, who):  # ignore the echo of a scroll we just caused ourselves
-            return self.lock == who and time.monotonic() < self.lock_until
-
-        def on_editor_scroll(self, adj):
-            if not self.editor_sw.get_visible() or self.locked("preview"):
-                return
-            self.lock, self.lock_until = "editor", time.monotonic() + 0.25
-            rng = adj.get_upper() - adj.get_page_size()
-            ratio = adj.get_value() / rng if rng > 0 else 0.0
-            js = ("var d=document.documentElement;"
-                  "window.scrollTo(0,%f*Math.max(0,d.scrollHeight-window.innerHeight));" % ratio)
-            self.view.run_javascript(js, None, None, None)
-
-        def on_preview_scroll(self, ucm, result):
-            if not self.editor_sw.get_visible() or self.locked("editor"):
-                return
-            val = result.get_js_value() if hasattr(result, "get_js_value") else result
-            ratio = max(0.0, min(1.0, val.to_double()))
-            adj = self.editor_sw.get_vadjustment()
-            rng = adj.get_upper() - adj.get_page_size()
-            if rng <= 0:
-                return
-            self.lock, self.lock_until = "preview", time.monotonic() + 0.25
-            adj.set_value(ratio * rng)
-
-        # ---------- loading ----------
-        def load(self, path, force=False):
-            if not path or not (force or self.confirm_discard()):
-                return
-            path = os.path.abspath(path)
-            try:
-                with open(path, encoding="utf-8", errors="replace") as f:
-                    text = f.read()
-                self.mtime = os.path.getmtime(path)
-            except OSError as e:
-                text, self.mtime = f"# Cannot open file\n\n{e}", 0
-            self.path = path
-            self.loading = True
-            self.buffer.set_text(text)
-            self.loading = False
-            self.dirty = False
-            self.update_title()
-            self.view.load_html(render(text, os.path.basename(path), self.theme),
-                                Gio.File.new_for_path(path).get_uri())
-
-        def poll(self):  # auto-reload when the file changes on disk (never over unsaved edits)
-            try:
-                if self.path and not self.dirty and os.path.getmtime(self.path) != self.mtime:
-                    self.load(self.path, force=True)
-            except OSError:
-                pass
+        # ---------- background ----------
+        def poll(self):  # auto-reload files that change on disk (never over unsaved edits)
+            for d in list(self.docs):
+                try:
+                    if d.path and not d.dirty and os.path.getmtime(d.path) != d.mtime:
+                        d.load(d.path)
+                except OSError:
+                    pass
             return True
 
         def open_dialog(self):
-            if not self.confirm_discard():
-                return
-            d = Gtk.FileChooserDialog(title="Open Markdown", parent=self, action=Gtk.FileChooserAction.OPEN)
-            d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Open", Gtk.ResponseType.OK)
+            dlg = Gtk.FileChooserDialog(title="Open Markdown", parent=self, action=Gtk.FileChooserAction.OPEN)
+            dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Open", Gtk.ResponseType.OK)
+            dlg.set_select_multiple(True)
             flt = Gtk.FileFilter()
             flt.set_name("Markdown")
             for p in ("*.md", "*.markdown", "*.mdown"):
                 flt.add_pattern(p)
-            d.add_filter(flt)
-            if d.run() == Gtk.ResponseType.OK:
-                self.load(d.get_filename(), force=True)
-            d.destroy()
-
-        def on_policy(self, view, decision, dtype):
-            if dtype != WebKit2.PolicyDecisionType.NAVIGATION_ACTION:
-                return False
-            uri = decision.get_navigation_action().get_request().get_uri()
-            base = Gio.File.new_for_path(self.path).get_uri() if self.path else ""
-            if uri.startswith("about:") or uri == base or uri.startswith(base + "#"):
-                return False
-            if uri.startswith("file://"):
-                p = GLib.filename_from_uri(uri.split("#")[0])[0]
-                if p.lower().endswith((".md", ".markdown")):
-                    decision.ignore()
-                    self.load(p)
-                    return True
-            decision.ignore()
-            Gio.AppInfo.launch_default_for_uri(uri, None)
-            return True
+            dlg.add_filter(flt)
+            paths = dlg.get_filenames() if dlg.run() == Gtk.ResponseType.OK else []
+            dlg.destroy()
+            for p in paths:
+                self.open_path(p)
 
     w = Viewer()
     w.show_all()
     if len(argv) > 1:
-        w.load(argv[1], force=True)
+        for p in argv[1:]:
+            w.open_path(p)
     else:
         w.open_dialog()
-        if not w.path:
-            return
+    if not w.docs:
+        return
     Gtk.main()
 
 
