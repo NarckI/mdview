@@ -508,6 +508,7 @@ def run(argv):
             self.preview_id = self.hl_id = 0
             self.lock, self.lock_until = None, 0.0
             self.hist = UndoStack()
+            self.back, self.fwd = [], []   # files visited before / after this one in this tab
             self.tab_box = self.tab_label = None
 
             self.editor = Gtk.TextView()
@@ -543,6 +544,7 @@ def run(argv):
             ucm.connect("script-message-received::scroll", self.on_preview_scroll)
             self.view = WebKit2.WebView.new_with_user_content_manager(ucm)
             self.view.connect("decide-policy", self.on_policy)
+            self.view.connect("button-press-event", win.on_mouse)   # mouse back/forward buttons
             self.view.get_find_controller().connect("counted-matches", lambda fc, n: win.on_counted(self, n))
             self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
             self.paned.pack1(self.editor_sw, True, False)
@@ -667,6 +669,25 @@ def run(argv):
                                 Gio.File.new_for_path(path).get_uri())
             self.run_highlight()
 
+        def navigate(self, path):
+            """Follow a link inside this tab, remembering where we came from."""
+            if not self.win.confirm_discard(self):
+                return
+            if self.path:
+                self.back.append(self.path)
+            self.fwd = []
+            self.load(path)
+            self.win.update_nav()
+
+        def go(self, back):
+            """Back / forward through the files visited in this tab."""
+            stack, other = (self.back, self.fwd) if back else (self.fwd, self.back)
+            if not stack or not self.win.confirm_discard(self):
+                return
+            other.append(self.path)
+            self.load(stack.pop())
+            self.win.update_nav()
+
         def on_policy(self, view, decision, dtype):
             if dtype != WebKit2.PolicyDecisionType.NAVIGATION_ACTION:
                 return False
@@ -678,7 +699,12 @@ def run(argv):
                 p = GLib.filename_from_uri(uri.split("#")[0])[0]
                 if p.lower().endswith((".md", ".markdown")):
                     decision.ignore()
-                    self.win.open_path(p)   # opens in a tab, or switches to it if already open
+                    act = decision.get_navigation_action()
+                    newtab = act.get_mouse_button() == 2 or bool(act.get_modifiers() & CTRL)
+                    if newtab:   # middle-click or Ctrl+click
+                        self.win.open_path(p)
+                    else:
+                        self.navigate(p)
                     return True
             decision.ignore()
             Gio.AppInfo.launch_default_for_uri(uri, None)
@@ -744,6 +770,14 @@ def run(argv):
             open_btn.set_tooltip_text("Open a file in a new tab (Ctrl+O)")
             open_btn.connect("clicked", lambda *a: self.open_dialog())
             hb.pack_start(open_btn)
+            self.back_btn = Gtk.Button(label="◀")
+            self.back_btn.set_tooltip_text("Back (Alt+Left or mouse back button)")
+            self.back_btn.connect("clicked", lambda *a: self.nav(True))
+            self.fwd_btn = Gtk.Button(label="▶")
+            self.fwd_btn.set_tooltip_text("Forward (Alt+Right or mouse forward button)")
+            self.fwd_btn.connect("clicked", lambda *a: self.nav(False))
+            hb.pack_start(self.back_btn)
+            hb.pack_start(self.fwd_btn)
             self.edit_btn = Gtk.ToggleButton(label="✎ Edit")
             self.edit_btn.set_tooltip_text("Edit this file with live preview (Ctrl+E)")
             self.edit_hid = self.edit_btn.connect("toggled", self.on_edit_toggled)
@@ -791,6 +825,7 @@ def run(argv):
             GLib.timeout_add(1000, self.poll)
             self.connect("key-press-event", self.on_key_press)
             self.connect("key-release-event", self.on_key_release)
+            self.connect("button-press-event", self.on_mouse)
             self.connect("focus-out-event", lambda *a: self.mru_commit() or False)
             self.connect("style-updated", lambda *a: self.refresh_palette())
             self.connect("delete-event", lambda *a: not self.confirm_all())
@@ -839,6 +874,7 @@ def run(argv):
             d.tab_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
             d.tab_label = Gtk.Label()
             d.tab_label.set_ellipsize(Pango.EllipsizeMode.END)
+            d.tab_label.set_width_chars(10)   # without a minimum an ellipsized label can shrink to nothing
             d.tab_label.set_max_width_chars(24)
             close = Gtk.Button()
             close.set_relief(Gtk.ReliefStyle.NONE)
@@ -904,8 +940,24 @@ def run(argv):
             self.edit_btn.handler_unblock(self.edit_hid)
             self.save_btn.set_visible(editing)
             self.refresh_tab(d)
+            self.update_nav()
             self.update_find_ui()
             self.refresh_find_context()
+
+        def update_nav(self):
+            d = self.doc
+            self.back_btn.set_sensitive(bool(d and d.back))
+            self.fwd_btn.set_sensitive(bool(d and d.fwd))
+
+        def nav(self, back):
+            if self.doc is not None:
+                self.doc.go(back)
+
+        def on_mouse(self, widget, ev):
+            if ev.button in (8, 9) and self.doc is not None:   # the mouse's back / forward buttons
+                self.doc.go(ev.button == 8)
+                return True
+            return False
 
         def open_path(self, path):
             path = os.path.realpath(path)
@@ -1044,6 +1096,9 @@ def run(argv):
                 return True
             if state == CTRL and key in (Gdk.KEY_Page_Down, Gdk.KEY_Page_Up):
                 self.step_tab(1 if key == Gdk.KEY_Page_Down else -1)
+                return True
+            if state == ALT and key in (Gdk.KEY_Left, Gdk.KEY_Right) and self.doc is not None:
+                self.doc.go(key == Gdk.KEY_Left)
                 return True
             if state == ALT and Gdk.KEY_1 <= key <= Gdk.KEY_9:
                 n = key - Gdk.KEY_1

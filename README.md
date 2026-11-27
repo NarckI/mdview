@@ -10,7 +10,8 @@ A small Markdown-only viewer and editor for Debian, built with GTK 3 and WebKitG
 - Edit mode with live preview and synchronized scrolling (`Ctrl+E`, save with `Ctrl+S`)
 - Find and replace (`Ctrl+F`, `Ctrl+H`, `F3` / `Shift+F3`)
 - Reloads automatically when the file changes on disk (never over unsaved edits)
-- Relative links to other `.md` files open in a new tab, web links open in your browser
+- Relative links to other `.md` files open in the same tab, with back / forward (mouse buttons, `Alt+Left` / `Alt+Right`,
+  or the header-bar arrows); middle-click or `Ctrl+click` a link to open it in a new tab. Web links open in your browser
 - Tabs: open several files at once, switch with `Ctrl+Tab` in most-recently-used order (like Alt+Tab)
 - Line-accurate scroll sync between the editor and the preview
 - Undo / redo in the editor (`Ctrl+Z`, `Ctrl+Y`), with Markdown syntax colouring
@@ -50,6 +51,7 @@ On older Debian releases use `gir1.2-webkit2-4.0` instead of `gir1.2-webkit2-4.1
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Switch to the previous / next tab in most-recently-used order (hold `Ctrl`, tap `Tab` to go further back, release to switch, `Esc` to cancel) |
 | `Ctrl+PgDn` / `Ctrl+PgUp` | Next / previous tab in tab-bar order |
 | `Alt+1` ... `Alt+9` | Jump to that tab |
+| `Alt+Left` / `Alt+Right`, mouse back / forward | Back / forward through followed links in this tab |
 | `Ctrl+E` | Toggle edit mode |
 | `Ctrl+S` | Save |
 | `Ctrl+Z` / `Ctrl+Y` (or `Ctrl+Shift+Z`) | Undo / redo (while the editor has focus) |
