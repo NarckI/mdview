@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 
 import markdown
@@ -110,6 +111,21 @@ function mdScroll(line, ratio) {
   } else y = ratio * max;
   window.scrollTo(0, Math.max(0, Math.min(max, y)));
 }
+function mdStatus(msg) {
+  var s = document.getElementById('mdstatus');
+  if (!msg) { if (s) s.remove(); return; }
+  if (!s) {
+    s = document.createElement('div'); s.id = 'mdstatus';
+    s.style.cssText = 'position:fixed;top:8px;right:12px;padding:4px 10px;border-radius:6px;background:#0969da;color:#fff;font:12px sans-serif;z-index:9';
+    document.body.appendChild(s);
+  }
+  s.textContent = msg;
+}
+function mdAppend(html, i, n) {
+  var a = document.querySelector('article'); if (!a) return;
+  a.insertAdjacentHTML('beforeend', html);
+  mdStatus(i < n ? 'Large file: rendering ' + Math.round(100 * i / n) + '%' : '');
+}
 var ticking = false;
 window.addEventListener('scroll', function () {
   if (ticking) return; ticking = true;
@@ -178,6 +194,45 @@ def render(text, title="Markdown", theme="auto"):
     attr = "" if theme == "auto" else f' data-theme="{theme}"'
     return (f"<!doctype html><html{attr}><head><meta charset='utf-8'><title>{htmlmod.escape(title)}</title>"
             f"<style>{CSS}</style></head><body><article>{body}</article><script>{JS}{tag_call(text)}</script></body></html>")
+
+
+LARGE_CHARS = 1000000    # above this a file opens in "large file mode"
+CHUNK_CHARS = 150000
+
+
+def render_shell(title, theme):
+    """Empty page that large files are streamed into chunk by chunk (see mdAppend)."""
+    attr = "" if theme == "auto" else f' data-theme="{theme}"'
+    return (f"<!doctype html><html{attr}><head><meta charset='utf-8'><title>{htmlmod.escape(title)}</title>"
+            f"<style>{CSS}</style></head><body><article></article>"
+            f"<script>{JS}mdStatus('Large file: rendering...');</script></body></html>")
+
+
+def split_chunks(text, size=None):
+    """Cut a big document into ~size-character pieces at blank lines between top-level blocks
+    (never inside a fenced code block or a list/quote), repeating the link reference definitions
+    in every piece so reference links still resolve."""
+    size = size or CHUNK_CHARS
+    lines = text.split("\n")
+    refs = "\n".join(ln for ln in lines if REF_RE.match(ln))
+    chunks, cur, n, fence = [], [], 0, None
+    for i, ln in enumerate(lines):
+        m = FENCE_RE.match(ln)
+        if m:
+            if fence is None:
+                fence = m.group(1)
+            elif ln.rstrip(" ") == fence:
+                fence = None
+        cur.append(ln)
+        n += len(ln) + 1
+        if n >= size and fence is None and not ln.strip():
+            nxt = next((x for x in lines[i + 1:i + 60] if x.strip()), "")
+            if nxt and not nxt[0].isspace() and not (UL_RE.match(nxt) or OL_RE.match(nxt) or QUOTE_RE.match(nxt)):
+                chunks.append("\n".join(cur))
+                cur, n = [], 0
+    if cur:
+        chunks.append("\n".join(cur))
+    return [c + "\n\n" + refs for c in chunks] if refs else chunks
 
 
 def load_theme():
@@ -508,6 +563,8 @@ def run(argv):
             self.preview_id = self.hl_id = 0
             self.lock, self.lock_until = None, 0.0
             self.hist = UndoStack()
+            self.large, self.ready, self.text_cache = False, True, ""   # large-file mode: buffer loads on demand
+            self.render_gen, self.shell_ready, self.queue = 0, False, []
             self.back, self.fwd = [], []   # files visited before / after this one in this tab
             self.tab_box = self.tab_label = None
 
@@ -544,6 +601,7 @@ def run(argv):
             ucm.connect("script-message-received::scroll", self.on_preview_scroll)
             self.view = WebKit2.WebView.new_with_user_content_manager(ucm)
             self.view.connect("decide-policy", self.on_policy)
+            self.view.connect("load-changed", self.on_load_changed)
             self.view.connect("button-press-event", win.on_mouse)   # mouse back/forward buttons
             self.view.get_find_controller().connect("counted-matches", lambda fc, n: win.on_counted(self, n))
             self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
@@ -555,6 +613,7 @@ def run(argv):
                 if sid:
                     GLib.source_remove(sid)
             self.preview_id = self.hl_id = 0
+            self.render_gen += 1   # stops a background render of a large file
 
         # ---------- editor colouring ----------
         def apply_palette(self, dark):
@@ -589,6 +648,8 @@ def run(argv):
             self.dirty = True
             self.update_label()
             self.win.on_doc_edited(self)
+            if self.large:   # re-rendering / re-colouring a huge file on every pause would freeze the UI
+                return
             if self.preview_id:
                 GLib.source_remove(self.preview_id)
             self.preview_id = GLib.timeout_add(250, self.live_preview)
@@ -631,12 +692,13 @@ def run(argv):
             self.win.refresh_tab(self)
 
         def save(self):
-            if not self.path:
+            if not self.path or not self.ready:
                 return
             start, end = self.buffer.get_bounds()
+            text = self.buffer.get_text(start, end, True)
             try:
                 with open(self.path, "w", encoding="utf-8") as f:
-                    f.write(self.buffer.get_text(start, end, True))
+                    f.write(text)
                 self.mtime = os.path.getmtime(self.path)
             except OSError as e:
                 self.win.message(f"Could not save: {e}")
@@ -644,6 +706,8 @@ def run(argv):
             self.dirty = False
             self.hist.mark_clean()
             self.update_label()
+            if self.large:
+                self.start_render(text)
 
         # ---------- loading ----------
         def load(self, path):
@@ -659,6 +723,20 @@ def run(argv):
                 if sid:
                     GLib.source_remove(sid)
             self.preview_id = self.hl_id = 0
+            self.large = len(text) > LARGE_CHARS
+            if self.large:   # keep the text aside; the editor only gets it if Edit is switched on
+                self.text_cache, self.ready = text, False
+                self.loading = True
+                self.buffer.set_text("")
+                self.loading = False
+                self.hist.clear()
+                self.dirty = False
+                self.update_label()
+                self.start_render(text)
+                if self.editor_sw.get_visible():
+                    self.ensure_buffer()
+                return
+            self.text_cache, self.ready = "", True
             self.loading = True
             self.buffer.set_text(text)
             self.loading = False
@@ -668,6 +746,56 @@ def run(argv):
             self.view.load_html(render(text, os.path.basename(path), self.win.theme),
                                 Gio.File.new_for_path(path).get_uri())
             self.run_highlight()
+
+        def ensure_buffer(self):
+            """Large files: put the text into the editor the first time it is needed."""
+            if self.ready:
+                return
+            self.loading = True
+            self.buffer.set_text(self.text_cache)
+            self.loading = False
+            self.hist.clear()
+            self.dirty = False
+            self.ready, self.text_cache = True, ""
+            self.update_label()
+
+        def start_render(self, text):
+            """Render in a worker thread, one chunk at a time, so the window stays usable."""
+            self.render_gen += 1
+            gen = self.render_gen
+            self.shell_ready, self.queue = False, []
+            self.view.load_html(render_shell(os.path.basename(self.path), self.win.theme),
+                                Gio.File.new_for_path(self.path).get_uri())
+            chunks = split_chunks(text)
+
+            def work():
+                for i, chunk in enumerate(chunks, 1):
+                    if gen != self.render_gen:
+                        return
+                    try:
+                        body = render_body(chunk)
+                    except Exception as e:   # keep going rather than leave the page half empty
+                        body = "<pre>%s</pre>" % htmlmod.escape(str(e))
+                    GLib.idle_add(self.on_chunk, gen, body, i, len(chunks))
+            threading.Thread(target=work, daemon=True).start()
+
+        def on_chunk(self, gen, body, i, n):
+            if gen == self.render_gen:
+                self.queue.append((body, i, n))
+                self.flush_chunks()
+            return False
+
+        def flush_chunks(self):
+            if not self.shell_ready:
+                return
+            for body, i, n in self.queue:
+                self.view.run_javascript("mdAppend(%s,%d,%d)" % (json.dumps(body), i, n), None, None, None)
+            self.queue = []
+
+        def on_load_changed(self, view, event):
+            if self.large and event == WebKit2.LoadEvent.FINISHED and not self.shell_ready:
+                self.shell_ready = True
+                self.flush_chunks()
 
         def navigate(self, path):
             """Follow a link inside this tab, remembering where we came from."""
@@ -1118,6 +1246,7 @@ def run(argv):
             if d is None:
                 return
             if btn.get_active():
+                d.ensure_buffer()
                 d.editor.show()
                 d.editor_sw.show()
                 self.save_btn.show()
